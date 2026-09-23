@@ -109,6 +109,78 @@ impl std::fmt::Debug for KlipyConfig {
     }
 }
 
+/// Bearer token that enables the Fleet relay-membership HTTP API.
+///
+/// Completely separate from `RELAY_OPERATOR_PUBKEYS`, owner/admin Nostr
+/// identities, and NIP-98. [`Debug`] is redacted so dumping [`Config`]
+/// cannot disclose the token or any hash of it.
+#[derive(Clone)]
+pub struct FleetMembershipToken(String);
+
+impl FleetMembershipToken {
+    /// The raw token string presented by Fleet as `Authorization: Bearer`.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse an optional env value. Empty/unset → `None`. A present value
+    /// must decode to at least 32 bytes (hex, standard/url-safe base64, or
+    /// raw UTF-8). The error never includes the token.
+    pub(crate) fn parse_env(raw: Option<&str>) -> Result<Option<Self>, ConfigError> {
+        let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let decoded = decode_fleet_membership_token_bytes(raw);
+        if decoded.len() < 32 {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_FLEET_MEMBERSHIP_TOKEN must decode to at least 32 bytes".to_string(),
+            ));
+        }
+        Ok(Some(Self(raw.to_string())))
+    }
+}
+
+impl std::fmt::Debug for FleetMembershipToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+/// Decode a configured Fleet membership token for the 32-byte floor check.
+///
+/// Hex (even-length, all hex digits) is tried first, then standard Base64,
+/// then URL-safe Base64 without padding. Anything else is treated as raw
+/// UTF-8 bytes. The original env string is what callers present as Bearer.
+fn decode_fleet_membership_token_bytes(raw: &str) -> Vec<u8> {
+    if raw.len().is_multiple_of(2) && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if let Ok(bytes) = hex::decode(raw) {
+            return bytes;
+        }
+    }
+    use base64::Engine as _;
+    if raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw) {
+            if !bytes.is_empty() {
+                return bytes;
+            }
+        }
+    }
+    if raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw) {
+            if !bytes.is_empty() {
+                return bytes;
+            }
+        }
+    }
+    raw.as_bytes().to_vec()
+}
+
 /// Maximum configured jitter, leaving ten seconds of the hard-drain budget for
 /// WebSocket close-frame delivery after the final delayed cancellation.
 pub const MAX_DRAIN_JITTER_MS: u64 = 20_000;
@@ -367,6 +439,13 @@ pub struct Config {
     /// Whether the configured web bundle serves Git browser routes in addition
     /// to the public invite landing page. Defaults to false.
     pub serve_git_web_gui: bool,
+
+    /// Optional Fleet relay-membership bearer token.
+    ///
+    /// When `None`, `PUT`/`GET`/`DELETE /v1/relay-members/{public_key_hex}`
+    /// are not mounted. When `Some`, those routes authenticate this token
+    /// only — never `RELAY_OPERATOR_PUBKEYS` or NIP-98.
+    pub fleet_membership_token: Option<FleetMembershipToken>,
 }
 
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
@@ -1208,6 +1287,10 @@ impl Config {
             ));
         }
 
+        let fleet_membership_token = FleetMembershipToken::parse_env(
+            std::env::var("BUZZ_FLEET_MEMBERSHIP_TOKEN").ok().as_deref(),
+        )?;
+
         Ok(Self {
             bind_addr,
             database_url,
@@ -1265,6 +1348,7 @@ impl Config {
             admin,
             web_dir,
             serve_git_web_gui,
+            fleet_membership_token,
         })
     }
 }
@@ -2388,5 +2472,71 @@ mod tests {
             matches!(result, Err(ConfigError::InvalidValue(ref msg)) if msg.contains("BUZZ_GIT_REPO_PATH")),
             "expected InvalidValue mentioning BUZZ_GIT_REPO_PATH, got {result:?}"
         );
+    }
+
+    fn config_with_fleet_token_env(value: Option<&str>) -> Result<Config, ConfigError> {
+        let previous = std::env::var_os("BUZZ_FLEET_MEMBERSHIP_TOKEN");
+        match value {
+            Some(value) => std::env::set_var("BUZZ_FLEET_MEMBERSHIP_TOKEN", value),
+            None => std::env::remove_var("BUZZ_FLEET_MEMBERSHIP_TOKEN"),
+        }
+        let config = Config::from_env();
+        match previous {
+            Some(previous) => std::env::set_var("BUZZ_FLEET_MEMBERSHIP_TOKEN", previous),
+            None => std::env::remove_var("BUZZ_FLEET_MEMBERSHIP_TOKEN"),
+        }
+        config
+    }
+
+    #[test]
+    fn fleet_membership_token_unset_or_empty_disables_the_api() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let unset = config_with_fleet_token_env(None).expect("unset token");
+        assert!(unset.fleet_membership_token.is_none());
+        let empty = config_with_fleet_token_env(Some("   ")).expect("blank token");
+        assert!(empty.fleet_membership_token.is_none());
+    }
+
+    #[test]
+    fn fleet_membership_token_rejects_short_values_without_echoing_them() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let short = "short!token";
+        let result = config_with_fleet_token_env(Some(short));
+        match result {
+            Err(ConfigError::InvalidValue(message)) => {
+                assert!(message.contains("BUZZ_FLEET_MEMBERSHIP_TOKEN"));
+                assert!(message.contains("at least 32 bytes"));
+                assert!(
+                    !message.contains(short),
+                    "short-token error must not echo the secret"
+                );
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        let short_hex = "aa".repeat(31); // 31 decoded bytes
+        let result = config_with_fleet_token_env(Some(&short_hex));
+        match result {
+            Err(ConfigError::InvalidValue(message)) => {
+                assert!(!message.contains(&short_hex));
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fleet_membership_token_accepts_32_decoded_bytes_and_redacts_debug() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let raw = "fleet-membership-test-token-32b!";
+        let config = config_with_fleet_token_env(Some(raw)).expect("32-byte token");
+        let token = config
+            .fleet_membership_token
+            .as_ref()
+            .expect("token configured");
+        assert_eq!(token.as_str(), raw);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(raw));
+        assert_eq!(format!("{token:?}"), "[REDACTED]");
     }
 }

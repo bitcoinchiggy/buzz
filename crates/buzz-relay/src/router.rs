@@ -153,6 +153,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         merged = merged.merge(admin_router);
     }
 
+    if state.config.fleet_membership_token.is_some() {
+        let fleet_router = Router::new()
+            .route(
+                "/v1/relay-members/{public_key_hex}",
+                get(api::fleet_membership::get_member)
+                    .put(api::fleet_membership::put_member)
+                    .delete(api::fleet_membership::delete_member),
+            )
+            .layer(RequestBodyLimitLayer::new(4 * 1024))
+            .with_state(state.clone());
+        merged = merged.merge(fleet_router);
+    }
+
     // Serve both bundles from one fallback. The admin host is checked first so
     // it can never fall through to the public web bundle.
     let web_dir = state.config.web_dir.clone();

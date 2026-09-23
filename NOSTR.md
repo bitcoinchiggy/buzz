@@ -300,6 +300,42 @@ nak event -k 9032 \
   ws://localhost:3000
 ```
 
+### Fleet relay-membership HTTP API
+
+When `BUZZ_FLEET_MEMBERSHIP_TOKEN` is set, the relay mounts a host-local membership
+adapter used by Fleet. The token is optional. Unset or blank leaves the routes
+unmounted. A present value must decode to at least 32 random bytes (even-length
+hex, standard Base64, URL-safe Base64 without padding, or raw UTF-8).
+
+This credential is completely separate from `RELAY_OPERATOR_PUBKEYS`, owner/admin
+Nostr identities, and NIP-98. Requests authenticate only as
+`Authorization: Bearer <token>`. The token and any hash of it are never logged
+or returned.
+
+| Method | Path | Effect |
+|--------|------|--------|
+| `PUT` | `/v1/relay-members/{public_key_hex}` | Admit `role=member` only |
+| `GET` | `/v1/relay-members/{public_key_hex}` | Observe membership + roster flags |
+| `DELETE` | `/v1/relay-members/{public_key_hex}` | Remove a non-owner member (missing is success) |
+
+Every request body is:
+
+```json
+{ "npub": "npub1...", "public_key_hex": "<64 lowercase hex>" }
+```
+
+`npub` and `public_key_hex` must name the same pubkey as the path. Unknown JSON
+fields and any private-material fields (`nsec`, `secret_key`, …) are rejected.
+The API never accepts `owner` or `admin` — existing owner/admin rows return 409
+on `PUT`, and `DELETE` keeps the existing atomic owner protection.
+
+Membership rows and the authoritative kind:13534 roster snapshot are separate
+facts. Mutating calls return 200 only when the requested membership state is
+correct *and* the current snapshot is confirmed. If the database write succeeds
+but roster publication or snapshot confirmation fails, the response is 503 with
+`roster_published=false`. This is stricter than invite/NIP-43 claim, which warns
+and still returns success after a publication failure.
+
 After each add/remove/role-change, the relay publishes a kind:13534 membership list event
 (relay-signed, NIP-70 protected) that clients can subscribe to:
 
