@@ -6,6 +6,8 @@
 //! community B (NIP-43 admission confinement). `pubkey` values are 64-char
 //! lowercase hex strings.
 
+use std::future::Future;
+
 use buzz_core::StoredEvent;
 use buzz_datastore_tracing::datastore_span;
 use chrono::{DateTime, Utc};
@@ -663,6 +665,427 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
     Ok(result.rows_affected())
 }
 
+/// One Fleet membership mutation applied under the kind:13534 advisory lock.
+#[derive(Debug)]
+pub enum FleetMembershipMutation<'a> {
+    /// Insert `role=member` when the pubkey is absent.
+    ///
+    /// An existing member is left unchanged. An existing owner or admin row is
+    /// not modified.
+    AdmitMember {
+        /// Who recorded the admission. Fleet passes `fleet-admission`.
+        added_by: Option<&'a str>,
+    },
+    /// Delete the row only when its stored role is `member`.
+    RemoveMember,
+}
+
+/// Authoritative result of [`Db::sync_fleet_membership_and_roster`].
+///
+/// `present` and `role` come from the same locked member read that was compared
+/// with, or written into, the kind:13534 snapshot.
+#[derive(Debug)]
+pub struct FleetMembershipConfirmation {
+    /// Whether the target pubkey was in the locked member read.
+    pub present: bool,
+    /// Stored role from that read, when the row existed.
+    pub role: Option<String>,
+    /// The committed kind:13534 snapshot matches that same member read.
+    pub roster_published: bool,
+    /// The mutation was refused because the row is owner or admin.
+    ///
+    /// The transaction is rolled back. No membership or snapshot write from
+    /// this call is committed.
+    pub refused_elevated_role: bool,
+    /// A snapshot replacement was attempted after the locked read mismatched.
+    pub publish_attempted: bool,
+    /// Newly inserted snapshot, when this call committed one.
+    pub published_event: Option<StoredEvent>,
+}
+
+fn nip43_membership_lock_key(community_id: CommunityId, relay_pubkey: &[u8]) -> i64 {
+    replaceable::event_replacement_lock_key(
+        community_id,
+        buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32,
+        relay_pubkey,
+        None,
+    )
+}
+
+struct LockedMembershipView {
+    members: Vec<(String, String)>,
+    present: bool,
+    role: Option<String>,
+    snapshot_matches: bool,
+}
+
+async fn sync_fleet_membership_in_transaction<F, Fut>(
+    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    community_id: CommunityId,
+    pubkey: &str,
+    mutation: FleetMembershipMutation<'_>,
+    relay_keypair: &nostr::Keys,
+    publish_roster: bool,
+    before_absent_insert: F,
+) -> Result<FleetMembershipConfirmation>
+where
+    F: FnOnce(String) -> Fut + Send,
+    Fut: Future<Output = ()> + Send,
+{
+    let pubkey_bytes = relay_keypair.public_key().to_bytes();
+    let lock_key = nip43_membership_lock_key(community_id, pubkey_bytes.as_slice());
+    observability::observe_advisory_lock(
+        observability::LockType::Membership,
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx),
+    )
+    .await?;
+
+    if let Some(role) = apply_fleet_membership_mutation(
+        &mut tx,
+        community_id,
+        pubkey,
+        mutation,
+        before_absent_insert,
+    )
+    .await?
+    {
+        tx.rollback().await?;
+        return Ok(FleetMembershipConfirmation {
+            present: true,
+            role: Some(role),
+            roster_published: false,
+            refused_elevated_role: true,
+            publish_attempted: false,
+            published_event: None,
+        });
+    }
+
+    let view =
+        read_locked_membership_view(&mut tx, community_id, pubkey, pubkey_bytes.as_slice()).await?;
+    if view.snapshot_matches || !publish_roster {
+        tx.commit().await?;
+        return Ok(FleetMembershipConfirmation {
+            present: view.present,
+            role: view.role,
+            roster_published: view.snapshot_matches,
+            refused_elevated_role: false,
+            publish_attempted: false,
+            published_event: None,
+        });
+    }
+
+    sqlx::query("SAVEPOINT fleet_roster")
+        .execute(&mut *tx)
+        .await?;
+    match insert_nip43_snapshot_in_transaction(&mut tx, community_id, relay_keypair, &view.members)
+        .await
+    {
+        Ok(Some(stored)) => {
+            sqlx::query("RELEASE SAVEPOINT fleet_roster")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(FleetMembershipConfirmation {
+                present: view.present,
+                role: view.role,
+                roster_published: true,
+                refused_elevated_role: false,
+                publish_attempted: true,
+                published_event: Some(stored),
+            })
+        }
+        Ok(None) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT fleet_roster")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            tracing::warn!("fleet membership snapshot already existed; roster not replaced");
+            Ok(FleetMembershipConfirmation {
+                present: view.present,
+                role: view.role,
+                roster_published: false,
+                refused_elevated_role: false,
+                publish_attempted: true,
+                published_event: None,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(%error, "fleet membership snapshot write failed");
+            sqlx::query("ROLLBACK TO SAVEPOINT fleet_roster")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(FleetMembershipConfirmation {
+                present: view.present,
+                role: view.role,
+                roster_published: false,
+                refused_elevated_role: false,
+                publish_attempted: true,
+                published_event: None,
+            })
+        }
+    }
+}
+
+/// Returns `Some(role)` when the row is owner/admin and must be left unchanged.
+async fn apply_fleet_membership_mutation<F, Fut>(
+    tx: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+    pubkey: &str,
+    mutation: FleetMembershipMutation<'_>,
+    before_absent_insert: F,
+) -> Result<Option<String>>
+where
+    F: FnOnce(String) -> Fut + Send,
+    Fut: Future<Output = ()> + Send,
+{
+    match mutation {
+        FleetMembershipMutation::AdmitMember { added_by } => {
+            let existing = select_member_role_for_update(tx, community_id, pubkey).await?;
+            match existing.as_deref() {
+                Some("member") => Ok(None),
+                Some(_) => Ok(existing),
+                None => {
+                    before_absent_insert(pubkey.to_owned()).await;
+                    let inserted = sqlx::query(
+                        "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
+                         VALUES ($1, $2, 'member', $3) \
+                         ON CONFLICT (community_id, pubkey) DO NOTHING",
+                    )
+                    .bind(community_id.as_uuid())
+                    .bind(pubkey)
+                    .bind(added_by)
+                    .execute(&mut *tx)
+                    .await?;
+                    if inserted.rows_affected() > 0 {
+                        return Ok(None);
+                    }
+                    let after_conflict =
+                        select_member_role_for_update(tx, community_id, pubkey).await?;
+                    match after_conflict.as_deref() {
+                        Some("member") | None => Ok(None),
+                        Some(_) => Ok(after_conflict),
+                    }
+                }
+            }
+        }
+        FleetMembershipMutation::RemoveMember => {
+            // Same predicate as `remove_relay_member_if_role(..., "member")`:
+            // the role check and the delete are one statement.
+            let deleted = sqlx::query(
+                "DELETE FROM relay_members \
+                 WHERE community_id = $1 AND pubkey = $2 AND role = 'member'",
+            )
+            .bind(community_id.as_uuid())
+            .bind(pubkey)
+            .execute(&mut *tx)
+            .await?;
+            if deleted.rows_affected() > 0 {
+                return Ok(None);
+            }
+            let existing = select_member_role_for_update(tx, community_id, pubkey).await?;
+            match existing.as_deref() {
+                None | Some("member") => Ok(None),
+                Some(_) => Ok(existing),
+            }
+        }
+    }
+}
+
+async fn select_member_role_for_update(
+    tx: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+    pubkey: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT role FROM relay_members \
+         WHERE community_id = $1 AND pubkey = $2 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    row.map(|row| row.try_get("role"))
+        .transpose()
+        .map_err(DbError::from)
+}
+
+async fn read_locked_membership_view(
+    tx: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+    pubkey: &str,
+    relay_pubkey: &[u8],
+) -> Result<LockedMembershipView> {
+    let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
+    // One statement, so the member rows and the live snapshot share a snapshot.
+    let rows = sqlx::query(
+        "WITH members AS (
+            SELECT pubkey, role, created_at
+            FROM relay_members
+            WHERE community_id = $1
+         ),
+         snap AS (
+            SELECT tags
+            FROM events
+            WHERE community_id = $2
+              AND kind = $3
+              AND pubkey = $4
+              AND channel_id IS NULL
+              AND deleted_at IS NULL
+            ORDER BY created_at DESC, id ASC
+            LIMIT 1
+         )
+         SELECT members.pubkey AS pubkey, members.role AS role, snap.tags AS tags
+         FROM members
+         FULL OUTER JOIN snap ON TRUE
+         ORDER BY members.created_at ASC NULLS LAST",
+    )
+    .bind(community_id.as_uuid())
+    .bind(community_id.as_uuid())
+    .bind(kind_i32)
+    .bind(relay_pubkey)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut members = Vec::new();
+    let mut snapshot_tags: Option<serde_json::Value> = None;
+    for row in rows {
+        let tags: Option<serde_json::Value> = row.try_get("tags")?;
+        if snapshot_tags.is_none() && tags.is_some() {
+            snapshot_tags = tags;
+        }
+        let member_pubkey: Option<String> = row.try_get("pubkey")?;
+        let role: Option<String> = row.try_get("role")?;
+        if let (Some(member_pubkey), Some(role)) = (member_pubkey, role) {
+            members.push((member_pubkey, role));
+        }
+    }
+
+    let target = members
+        .iter()
+        .find(|(member_pubkey, _)| member_pubkey.eq_ignore_ascii_case(pubkey));
+    Ok(LockedMembershipView {
+        snapshot_matches: snapshot_matches_members(snapshot_tags.as_ref(), &members),
+        present: target.is_some(),
+        role: target.map(|(_, role)| role.clone()),
+        members,
+    })
+}
+
+fn snapshot_matches_members(
+    snapshot_tags: Option<&serde_json::Value>,
+    members: &[(String, String)],
+) -> bool {
+    let Some(snapshot_tags) = snapshot_tags else {
+        return false;
+    };
+    let Some(tags) = snapshot_tags.as_array() else {
+        return false;
+    };
+    let mut snapshot_members = Vec::new();
+    for tag in tags {
+        let Some(parts) = tag.as_array() else {
+            return false;
+        };
+        let name = parts.first().and_then(serde_json::Value::as_str);
+        if name == Some("member") {
+            let Some(pubkey) = parts.get(1).and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some(role) = parts.get(2).and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            snapshot_members.push((pubkey.to_ascii_lowercase(), role.to_owned()));
+        }
+    }
+    let mut canonical: Vec<(String, String)> = members
+        .iter()
+        .map(|(pubkey, role)| (pubkey.to_ascii_lowercase(), role.clone()))
+        .collect();
+    snapshot_members.sort_unstable();
+    canonical.sort_unstable();
+    snapshot_members == canonical
+}
+
+async fn insert_nip43_snapshot_in_transaction(
+    tx: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+    relay_keypair: &nostr::Keys,
+    members: &[(String, String)],
+) -> Result<Option<StoredEvent>> {
+    use nostr::{EventBuilder, Kind, Tag};
+
+    let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
+    let pubkey_bytes = relay_keypair.public_key().to_bytes();
+    let mut tags: Vec<Tag> = Vec::with_capacity(members.len() + 1);
+    tags.push(
+        Tag::parse(["-"])
+            .map_err(|e| DbError::InvalidData(format!("failed to build '-' tag: {e}")))?,
+    );
+    for (pubkey, role) in members {
+        tags.push(
+            Tag::parse(["member", pubkey, role])
+                .map_err(|e| DbError::InvalidData(format!("failed to build member tag: {e}")))?,
+        );
+    }
+
+    let event = EventBuilder::new(Kind::Custom(kind_i32 as u16), "")
+        .tags(tags)
+        .sign_with_keys(relay_keypair)
+        .map_err(|e| DbError::InvalidData(format!("failed to sign kind:13534: {e}")))?;
+
+    let created_at_secs = event.created_at.as_secs() as i64;
+    let created_at = chrono::DateTime::from_timestamp(created_at_secs, 0)
+        .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
+    let sig_bytes = event.sig.serialize();
+    let tags_json = serde_json::to_value(&event.tags)?;
+    let received_at = chrono::Utc::now();
+    let d_tag = crate::event::extract_d_tag(&event);
+
+    sqlx::query(
+        "UPDATE events SET deleted_at = NOW() \
+         WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
+         AND channel_id IS NULL \
+         AND deleted_at IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(kind_i32)
+    .bind(pubkey_bytes.as_slice())
+    .execute(&mut *tx)
+    .await?;
+
+    let insert_result = sqlx::query(
+        "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event.id.as_bytes().as_slice())
+    .bind(pubkey_bytes.as_slice())
+    .bind(created_at)
+    .bind(kind_i32)
+    .bind(&tags_json)
+    .bind(&event.content)
+    .bind(sig_bytes.as_slice())
+    .bind(received_at)
+    .bind::<Option<Uuid>>(None)
+    .bind(d_tag.as_deref())
+    .execute(&mut *tx)
+    .await?;
+
+    if insert_result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(StoredEvent::with_received_at(
+        event,
+        received_at,
+        None,
+        true,
+    )))
+}
+
 impl Db {
     /// Returns `true` if `pubkey` (64-char hex) is a member of `community`.
     ///
@@ -971,12 +1394,7 @@ impl Db {
         let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
         let pubkey_bytes = relay_keypair.public_key().to_bytes();
 
-        let lock_key = replaceable::event_replacement_lock_key(
-            community_id,
-            kind_i32,
-            pubkey_bytes.as_slice(),
-            None,
-        );
+        let lock_key = nip43_membership_lock_key(community_id, pubkey_bytes.as_slice());
 
         let (mut tx, transaction_timer) = observability::begin_transaction(
             &self.pool,
@@ -1091,6 +1509,64 @@ impl Db {
             was_inserted,
             member_count,
         ))
+    }
+
+    /// Apply one Fleet membership change and confirm kind:13534 under the same
+    /// advisory lock roster publication already uses.
+    ///
+    /// The lock is taken before the mutation. The post-mutation member rows and
+    /// the live snapshot are then read in one statement, so HTTP success is not
+    /// assembled from two different membership generations. When the snapshot
+    /// differs, it is replaced from those same rows before commit.
+    ///
+    /// Owner and admin rows are never inserted, updated, or deleted. A refused
+    /// elevated role rolls the transaction back. A snapshot write failure rolls
+    /// back only that write and still commits the membership change, with
+    /// [`FleetMembershipConfirmation::roster_published`] set to `false`.
+    #[datastore_span(name = "sync_fleet_membership_and_roster", system = "postgresql")]
+    pub async fn sync_fleet_membership_and_roster<F, Fut>(
+        &self,
+        community_id: CommunityId,
+        pubkey: &str,
+        mutation: FleetMembershipMutation<'_>,
+        relay_keypair: &nostr::Keys,
+        publish_roster: bool,
+        before_absent_insert: F,
+    ) -> Result<FleetMembershipConfirmation>
+    where
+        F: FnOnce(String) -> Fut + Send,
+        Fut: Future<Output = ()> + Send,
+    {
+        let (tx, transaction_timer) = observability::begin_transaction(
+            &self.pool,
+            observability::TransactionOperation::PublishNip43MembershipLocked,
+        )
+        .await?;
+        let pubkey = pubkey.to_owned();
+        let confirmation = transaction_timer
+            .observe(async move {
+                sync_fleet_membership_in_transaction(
+                    tx,
+                    community_id,
+                    &pubkey,
+                    mutation,
+                    relay_keypair,
+                    publish_roster,
+                    before_absent_insert,
+                )
+                .await
+            })
+            .await?;
+
+        if let Some(stored) = confirmation.published_event.as_ref() {
+            if let Err(e) =
+                crate::insert_mentions(&self.pool, community_id, &stored.event, None).await
+            {
+                tracing::warn!(event_id = %stored.event.id, "Failed to insert mentions: {e}");
+            }
+        }
+
+        Ok(confirmation)
     }
 }
 

@@ -316,7 +316,7 @@ or returned.
 |--------|------|--------|
 | `PUT` | `/v1/relay-members/{public_key_hex}` | Admit `role=member` only |
 | `GET` | `/v1/relay-members/{public_key_hex}` | Observe membership + roster flags |
-| `DELETE` | `/v1/relay-members/{public_key_hex}` | Remove a non-owner member (missing is success) |
+| `DELETE` | `/v1/relay-members/{public_key_hex}` | Remove `role=member` only (missing is success) |
 
 Every request body is:
 
@@ -326,8 +326,9 @@ Every request body is:
 
 `npub` and `public_key_hex` must name the same pubkey as the path. Unknown JSON
 fields and any private-material fields (`nsec`, `secret_key`, …) are rejected.
-The API never accepts `owner` or `admin` — existing owner/admin rows return 409
-on `PUT`, and `DELETE` keeps the existing atomic owner protection.
+The API never accepts `owner` or `admin`. Existing owner/admin rows return 409
+on `PUT` and are left unchanged. `DELETE` removes only `role=member`; owner and
+admin rows return 409 and stay in place. Missing members are idempotent success.
 
 Membership rows and the authoritative kind:13534 roster snapshot are separate
 facts. Mutating calls return 200 only when the requested membership state is

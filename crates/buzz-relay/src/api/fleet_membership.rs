@@ -26,8 +26,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
+use buzz_db::relay_members::FleetMembershipMutation;
+
 use crate::config::FleetMembershipToken;
-use crate::handlers::side_effects::publish_nip43_membership_list;
+use crate::handlers::event::dispatch_persistent_event;
 use crate::state::AppState;
 use crate::tenant::bind_deployment_community;
 
@@ -46,20 +49,22 @@ const PRIVATE_MATERIAL_KEYS: &[&str] = &[
 ];
 
 #[cfg(test)]
-static FORCE_ROSTER_PUBLISH_FAILURE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FORCE_ROSTER_PUBLISH_FAILURE: std::sync::Mutex<Option<buzz_core::CommunityId>> =
+    std::sync::Mutex::new(None);
 
-/// Test-only guard that forces the next roster publication to fail.
+/// Test-only guard that forces roster publication to fail for one community.
 ///
-/// Drop restores the previous behavior so one test cannot leak the hook
-/// into another.
+/// Other communities keep publishing, so parallel tests do not observe this
+/// hook. Drop clears it.
 #[cfg(test)]
 pub(crate) struct ForceRosterPublishFailure;
 
 #[cfg(test)]
 impl ForceRosterPublishFailure {
-    fn arm() -> Self {
-        FORCE_ROSTER_PUBLISH_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+    fn arm(community: buzz_core::CommunityId) -> Self {
+        *FORCE_ROSTER_PUBLISH_FAILURE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(community);
         Self
     }
 }
@@ -67,7 +72,9 @@ impl ForceRosterPublishFailure {
 #[cfg(test)]
 impl Drop for ForceRosterPublishFailure {
     fn drop(&mut self) {
-        FORCE_ROSTER_PUBLISH_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut forced) = FORCE_ROSTER_PUBLISH_FAILURE.lock() {
+            *forced = None;
+        }
     }
 }
 
@@ -94,41 +101,16 @@ pub async fn put_member(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let identity = authorize_and_verify(&state, &headers, &public_key_hex, &body)?;
     let tenant = deployment_tenant(&state).await?;
-
-    match state
-        .db
-        .get_relay_member(tenant.community(), &identity.public_key_hex)
-        .await
-    {
-        Ok(Some(existing)) if existing.role == FLEET_ROLE => {}
-        Ok(Some(_)) => {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                "cannot admit owner or admin through the fleet membership API",
-            ));
-        }
-        Ok(None) => {
-            state
-                .db
-                .add_relay_member(
-                    tenant.community(),
-                    &identity.public_key_hex,
-                    FLEET_ROLE,
-                    Some(FLEET_ADDED_BY),
-                )
-                .await
-                .map_err(|e| {
-                    tracing::error!("fleet membership insert failed: {e}");
-                    internal_error("fleet membership persistence failed")
-                })?;
-        }
-        Err(e) => {
-            tracing::error!("fleet membership lookup failed: {e}");
-            return Err(internal_error("fleet membership lookup failed"));
-        }
-    }
-
-    finish_mutation(&state, &tenant, &identity, true, Some(FLEET_ROLE)).await
+    sync_membership(
+        &state,
+        &tenant,
+        &identity,
+        FleetMembershipMutation::AdmitMember {
+            added_by: Some(FLEET_ADDED_BY),
+        },
+        true,
+    )
+    .await
 }
 
 /// `GET /v1/relay-members/{public_key_hex}` — observational membership + roster flags.
@@ -164,10 +146,10 @@ pub async fn get_member(
     )))
 }
 
-/// `DELETE /v1/relay-members/{public_key_hex}` — remove a non-owner member.
+/// `DELETE /v1/relay-members/{public_key_hex}` — remove `role=member` only.
 ///
-/// Missing members are idempotent success. Owner removal is refused by the
-/// existing atomic `DELETE … WHERE role <> 'owner'` protection.
+/// Missing members are idempotent success. Owner and admin rows are refused
+/// and left unchanged.
 pub async fn delete_member(
     State(state): State<Arc<AppState>>,
     Path(public_key_hex): Path<String>,
@@ -176,67 +158,141 @@ pub async fn delete_member(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let identity = authorize_and_verify(&state, &headers, &public_key_hex, &body)?;
     let tenant = deployment_tenant(&state).await?;
-
-    match state
-        .db
-        .remove_relay_member(tenant.community(), &identity.public_key_hex)
-        .await
-    {
-        Ok(buzz_db::relay_members::RemoveResult::Removed)
-        | Ok(buzz_db::relay_members::RemoveResult::NotFound) => {}
-        Ok(buzz_db::relay_members::RemoveResult::IsOwner) => {
-            return Err(api_error(StatusCode::CONFLICT, "cannot remove relay owner"));
-        }
-        Ok(buzz_db::relay_members::RemoveResult::RoleMismatch) => {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                "cannot remove relay member: role mismatch",
-            ));
-        }
-        Err(e) => {
-            tracing::error!("fleet membership delete failed: {e}");
-            return Err(internal_error("fleet membership persistence failed"));
-        }
-    }
-
-    finish_mutation(&state, &tenant, &identity, false, None).await
+    sync_membership(
+        &state,
+        &tenant,
+        &identity,
+        FleetMembershipMutation::RemoveMember,
+        false,
+    )
+    .await
 }
 
-async fn finish_mutation(
+/// `desired_present` is the membership state this call is allowed to report as
+/// success: `true` for admit, `false` for remove.
+async fn sync_membership(
     state: &Arc<AppState>,
     tenant: &buzz_core::TenantContext,
     identity: &VerifiedIdentity,
-    present: bool,
-    role: Option<&str>,
+    mutation: FleetMembershipMutation<'_>,
+    desired_present: bool,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if roster_is_current(state, tenant).await? {
+    let confirmation = state
+        .db
+        .sync_fleet_membership_and_roster(
+            tenant.community(),
+            &identity.public_key_hex,
+            mutation,
+            &state.relay_keypair,
+            roster_publish_enabled(tenant.community()),
+            before_fleet_admit_insert,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("fleet membership sync failed: {e}");
+            internal_error("fleet membership persistence failed")
+        })?;
+
+    if confirmation.refused_elevated_role {
+        return Err(elevated_role_conflict(
+            desired_present,
+            confirmation.role.as_deref(),
+        ));
+    }
+
+    if confirmation.publish_attempted {
+        metrics::counter!("buzz_nip43_membership_publications_total", "result" => "attempted")
+            .increment(1);
+        let result = if confirmation.roster_published {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        metrics::counter!("buzz_nip43_membership_publications_total", "result" => result)
+            .increment(1);
+    }
+
+    if let Some(stored) = confirmation.published_event.as_ref() {
+        let relay_pubkey_hex = state.relay_keypair.public_key().to_hex();
+        dispatch_persistent_event(
+            tenant,
+            state,
+            stored,
+            KIND_NIP43_MEMBERSHIP_LIST,
+            &relay_pubkey_hex,
+            None,
+        )
+        .await;
+        tracing::info!("NIP-43 membership list published");
+    }
+
+    let present = confirmation.present;
+    let role = confirmation.role.as_deref().filter(|_| present);
+    let desired_ok = if desired_present {
+        present && confirmation.role.as_deref() == Some(FLEET_ROLE)
+    } else {
+        !present
+    };
+    if confirmation.roster_published && desired_ok {
         return Ok(Json(member_body(identity, role, present, true)));
     }
 
-    if !publish_roster(state, tenant).await {
-        return Err(unavailable(identity, present, role));
-    }
+    Err(confirmation_failure(
+        identity,
+        present,
+        role,
+        confirmation.roster_published,
+    ))
+}
 
-    if roster_is_current(state, tenant).await? {
-        Ok(Json(member_body(identity, role, present, true)))
+fn elevated_role_conflict(admitting: bool, role: Option<&str>) -> (StatusCode, Json<Value>) {
+    if admitting {
+        api_error(
+            StatusCode::CONFLICT,
+            "cannot admit owner or admin through the fleet membership API",
+        )
+    } else if role == Some("owner") {
+        api_error(StatusCode::CONFLICT, "cannot remove relay owner")
     } else {
-        Err(unavailable(identity, present, role))
+        api_error(StatusCode::CONFLICT, "cannot remove relay admin")
     }
 }
 
-async fn publish_roster(state: &Arc<AppState>, tenant: &buzz_core::TenantContext) -> bool {
+fn roster_publish_enabled(community: buzz_core::CommunityId) -> bool {
     #[cfg(test)]
-    if FORCE_ROSTER_PUBLISH_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
-        tracing::warn!("fleet membership roster publication forced to fail");
-        return false;
+    {
+        FORCE_ROSTER_PUBLISH_FAILURE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_none_or(|forced| forced != community)
     }
+    #[cfg(not(test))]
+    {
+        let _ = community;
+        true
+    }
+}
 
-    match publish_nip43_membership_list(tenant, state).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(%error, "fleet membership roster publication failed");
-            false
-        }
+async fn before_fleet_admit_insert(pubkey: String) {
+    #[cfg(test)]
+    {
+        let release = {
+            let mut gate = ADMIT_RACE_GATE
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let matches = gate.as_ref().is_some_and(|armed| armed.pubkey == pubkey);
+            if !matches {
+                return;
+            }
+            let armed = gate.take().expect("admit race gate");
+            let _ = armed.entered.send(());
+            armed.release
+        };
+        let _ = release.await;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = pubkey;
     }
 }
 
@@ -447,14 +503,74 @@ fn member_body(
     })
 }
 
-fn unavailable(
+fn confirmation_failure(
     identity: &VerifiedIdentity,
     present: bool,
     role: Option<&str>,
+    roster_published: bool,
 ) -> (StatusCode, Json<Value>) {
-    let mut body = member_body(identity, role, present, false);
-    body["error"] = json!("roster publication failed");
+    let mut body = member_body(identity, role, present, roster_published);
+    let error = if roster_published {
+        "membership confirmation failed"
+    } else {
+        "roster publication failed"
+    };
+    body["error"] = json!(error);
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
+#[cfg(test)]
+struct AdmitRaceGate {
+    pubkey: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static ADMIT_RACE_GATE: std::sync::Mutex<Option<AdmitRaceGate>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct AdmitRaceHandle {
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl AdmitRaceHandle {
+    fn arm(pubkey: &str) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *ADMIT_RACE_GATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(AdmitRaceGate {
+            pubkey: pubkey.to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (
+            Self {
+                release: Some(release_tx),
+            },
+            entered_rx,
+        )
+    }
+
+    fn release_insert(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AdmitRaceHandle {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Ok(mut gate) = ADMIT_RACE_GATE.lock() {
+            *gate = None;
+        }
+    }
 }
 
 fn unauthorized() -> (StatusCode, Json<Value>) {
@@ -622,7 +738,7 @@ mod http_tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use super::{ForceRosterPublishFailure, FLEET_ADDED_BY};
+    use super::{AdmitRaceHandle, ForceRosterPublishFailure, FLEET_ADDED_BY};
     use crate::config::FleetMembershipToken;
     use crate::router::build_router;
     use crate::state::AppState;
@@ -774,6 +890,104 @@ mod http_tests {
             .bootstrap_owner(community, &owner.public_key().to_hex())
             .await
             .expect("bootstrap owner");
+    }
+
+    /// The successful response's role must still be the role stored in the
+    /// latest kind:13534 snapshot. A 200 built from a stale pre-insert read
+    /// would claim `member` while the snapshot does not.
+    async fn assert_confirmed_member(state: &AppState, host: &str, hex: &str) {
+        use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
+        use buzz_db::EventQuery;
+
+        let community = state
+            .db
+            .lookup_community_by_host(host)
+            .await
+            .expect("lookup")
+            .expect("community")
+            .id;
+        let row = state
+            .db
+            .get_relay_member(community, hex)
+            .await
+            .expect("member row")
+            .unwrap_or_else(|| panic!("200 claimed member {hex} but the row is absent"));
+        assert_eq!(row.role, "member", "{hex}");
+
+        let snapshot = state
+            .db
+            .query_events_for_maintenance(&EventQuery {
+                kinds: Some(vec![KIND_NIP43_MEMBERSHIP_LIST as i32]),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                global_only: true,
+                limit: Some(1),
+                ..EventQuery::for_community(community)
+            })
+            .await
+            .expect("snapshot query");
+        let event = snapshot.first().unwrap_or_else(|| {
+            panic!("200 claimed a published roster but none is stored for {hex}")
+        });
+        let snapshot_role = event.event.tags.iter().find_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.first().map(String::as_str) == Some("member")
+                && parts.get(1).map(String::as_str) == Some(hex))
+            .then(|| parts.get(2).map(String::as_str).unwrap_or(""))
+        });
+        assert_eq!(
+            snapshot_role,
+            Some("member"),
+            "snapshot for {hex} was {snapshot_role:?}; response claimed member"
+        );
+    }
+
+    /// A successful delete must already have removed the key from the latest
+    /// kind:13534 snapshot. A 200 built from an earlier membership generation
+    /// would still list that key.
+    async fn assert_confirmed_absent(state: &AppState, host: &str, hex: &str) {
+        use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
+        use buzz_db::EventQuery;
+
+        let community = state
+            .db
+            .lookup_community_by_host(host)
+            .await
+            .expect("lookup")
+            .expect("community")
+            .id;
+        assert!(
+            state
+                .db
+                .get_relay_member(community, hex)
+                .await
+                .expect("member lookup")
+                .is_none(),
+            "200 claimed {hex} was absent but the row remains"
+        );
+
+        let snapshot = state
+            .db
+            .query_events_for_maintenance(&EventQuery {
+                kinds: Some(vec![KIND_NIP43_MEMBERSHIP_LIST as i32]),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                global_only: true,
+                limit: Some(1),
+                ..EventQuery::for_community(community)
+            })
+            .await
+            .expect("snapshot query");
+        let event = snapshot
+            .first()
+            .unwrap_or_else(|| panic!("200 claimed a published roster but none is stored"));
+        let still_listed = event.event.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("member")
+                && parts.get(1).map(String::as_str) == Some(hex)
+        });
+        assert!(
+            !still_listed,
+            "snapshot still lists {hex} after a 200 delete"
+        );
     }
 
     #[tokio::test]
@@ -1140,12 +1354,106 @@ mod http_tests {
             .await
             .expect("add admin");
         let (admin_hex, admin_body) = member_body(&admin);
-        let (put_admin, json) = call(state, "PUT", &admin_hex, Some(TEST_TOKEN), admin_body).await;
+        let (put_admin, json) = call(
+            state.clone(),
+            "PUT",
+            &admin_hex,
+            Some(TEST_TOKEN),
+            admin_body.clone(),
+        )
+        .await;
         assert_eq!(put_admin, StatusCode::CONFLICT, "{json}");
         assert!(json["error"]
             .as_str()
             .unwrap()
             .contains("cannot admit owner or admin"));
+
+        let (del_admin, json) = call(
+            state.clone(),
+            "DELETE",
+            &admin_hex,
+            Some(TEST_TOKEN),
+            admin_body,
+        )
+        .await;
+        assert_eq!(del_admin, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["error"], "cannot remove relay admin");
+
+        let owner_row = state
+            .db
+            .get_relay_member(community, &owner_hex)
+            .await
+            .expect("owner lookup")
+            .expect("owner row remains");
+        assert_eq!(owner_row.role, "owner");
+        let admin_row = state
+            .db
+            .get_relay_member(community, &admin_hex)
+            .await
+            .expect("admin lookup")
+            .expect("admin row remains");
+        assert_eq!(admin_row.role, "admin");
+    }
+
+    /// The first membership read can observe no row, and an owner/admin insert
+    /// can commit before `INSERT … ON CONFLICT DO NOTHING`. HTTP 200 must not
+    /// report `role=member` for that elevated row.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn put_loses_the_race_to_an_admin_insert_and_does_not_downgrade() {
+        let host = format!("fleet-race-{}.example", Uuid::new_v4().simple());
+        let state = postgres_state(&host)
+            .await
+            .expect("requires reachable Postgres");
+        let owner = Keys::generate();
+        bootstrap_owner(&state, &host, &owner).await;
+        let admin = Keys::generate();
+        let (hex, body) = member_body(&admin);
+        let (handle, entered) = AdmitRaceHandle::arm(&hex);
+
+        let put_state = state.clone();
+        let put_hex = hex.clone();
+        let put =
+            tokio::spawn(
+                async move { call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await },
+            );
+        entered
+            .await
+            .expect("admit path must reach the absent-insert hook");
+
+        let community = state
+            .db
+            .lookup_community_by_host(&host)
+            .await
+            .expect("lookup")
+            .expect("community")
+            .id;
+        let inserted = state
+            .db
+            .add_relay_member(community, &hex, "admin", None)
+            .await
+            .expect("insert admin during admit");
+        assert!(inserted, "admin row must be the first insert");
+        handle.release_insert();
+
+        let (status, json) = put.await.expect("join");
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(
+            json["error"],
+            "cannot admit owner or admin through the fleet membership API"
+        );
+        assert!(
+            json.get("role").is_none(),
+            "409 must not claim role=member: {json}"
+        );
+        let row = state
+            .db
+            .get_relay_member(community, &hex)
+            .await
+            .expect("get")
+            .expect("admin remains");
+        assert_eq!(row.role, "admin");
+        assert_ne!(row.added_by.as_deref(), Some(FLEET_ADDED_BY));
     }
 
     #[tokio::test]
@@ -1159,14 +1467,6 @@ mod http_tests {
         bootstrap_owner(&state, &host, &owner).await;
         let member = Keys::generate();
         let (hex, body) = member_body(&member);
-        let _guard = ForceRosterPublishFailure::arm();
-
-        let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
-        assert_eq!(json["roster_published"], false);
-        assert_eq!(json["present"], true);
-        assert_eq!(json["role"], "member");
-
         let community = state
             .db
             .lookup_community_by_host(&host)
@@ -1174,6 +1474,14 @@ mod http_tests {
             .expect("lookup")
             .expect("community")
             .id;
+        let _guard = ForceRosterPublishFailure::arm(community);
+
+        let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["roster_published"], false);
+        assert_eq!(json["present"], true);
+        assert_eq!(json["role"], "member");
+
         assert!(
             state
                 .db
@@ -1199,8 +1507,15 @@ mod http_tests {
         for keys in &members {
             let (hex, body) = member_body(keys);
             let state = state.clone();
+            let host = host.clone();
             tasks.push(tokio::spawn(async move {
-                call(state, "PUT", &hex, Some(TEST_TOKEN), body).await
+                let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
+                assert_eq!(status, StatusCode::OK, "{json}");
+                assert_eq!(json["present"], true, "{json}");
+                assert_eq!(json["role"], "member", "{json}");
+                assert_eq!(json["roster_published"], true, "{json}");
+                assert_confirmed_member(&state, &host, &hex).await;
+                (status, json)
             }));
         }
         let mut statuses = Vec::new();
@@ -1229,6 +1544,54 @@ mod http_tests {
                 "missing member {hex}"
             );
         }
+        assert!(
+            !state
+                .db
+                .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
+                    community,
+                    &state.relay_keypair.public_key(),
+                )
+                .await
+                .expect("snapshot compare"),
+            "roster drifted while concurrent admits were still returning 200; statuses={statuses:?}"
+        );
+
+        let mut removals = Vec::new();
+        for keys in &members {
+            let (hex, body) = member_body(keys);
+            let state = state.clone();
+            let host = host.clone();
+            removals.push(tokio::spawn(async move {
+                let (status, json) =
+                    call(state.clone(), "DELETE", &hex, Some(TEST_TOKEN), body).await;
+                assert_eq!(status, StatusCode::OK, "{json}");
+                assert_eq!(json["present"], false, "{json}");
+                assert!(json["role"].is_null(), "{json}");
+                assert_eq!(json["roster_published"], true, "{json}");
+                assert_confirmed_absent(&state, &host, &hex).await;
+                (status, json)
+            }));
+        }
+        for task in removals {
+            statuses.push(task.await.expect("join"));
+        }
+
+        let listed = state
+            .db
+            .list_relay_members(community)
+            .await
+            .expect("list members");
+        for keys in &members {
+            let hex = keys.public_key().to_hex();
+            assert!(
+                listed.iter().all(|row| row.pubkey != hex),
+                "delete 200 left {hex} in relay_members"
+            );
+        }
+        assert!(
+            listed.iter().any(|row| row.role == "owner"),
+            "concurrent deletes removed the owner"
+        );
 
         let stale = state
             .db
