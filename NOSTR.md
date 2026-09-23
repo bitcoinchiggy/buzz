@@ -335,7 +335,10 @@ facts. Mutating calls return 200 only when the requested membership state is
 correct *and* the current snapshot is confirmed. If the database write succeeds
 but roster publication or snapshot confirmation fails, the response is 503 with
 `roster_published=false`. This is stricter than invite/NIP-43 claim, which warns
-and still returns success after a publication failure.
+and still returns success after a publication failure. Membership writes that
+change presence, role, or ownership take the same per-community lock as that
+roster confirmation, so a 200 cannot be built while another member key commits
+outside that window.
 
 After each add/remove/role-change, the relay publishes a kind:13534 membership list event
 (relay-signed, NIP-70 protected) that clients can subscribe to:

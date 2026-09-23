@@ -447,6 +447,7 @@ impl Db {
                 return Ok(CreateCommunityWithOwnerResult::LimitReached);
             }
 
+            relay_members::lock_nip43_membership(&mut tx, CommunityId::from_uuid(id)).await?;
             sqlx::query(
                 "INSERT INTO relay_members (community_id, pubkey, role, added_by) VALUES ($1, $2, 'owner', NULL)",
             )

@@ -152,8 +152,10 @@ pub async fn add_relay_member(
     role: &str,
     added_by: Option<&str>,
 ) -> Result<bool> {
-    let mut connection =
+    let connection =
         observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    lock_nip43_membership(&mut tx, community).await?;
     let result = sqlx::query(
         "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
          VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, pubkey) DO NOTHING",
@@ -162,9 +164,11 @@ pub async fn add_relay_member(
     .bind(pubkey)
     .bind(role)
     .bind(added_by)
-    .execute(&mut *connection)
+    .execute(&mut *tx)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let inserted = result.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 /// Claims relay membership via an invite and atomically persists policy evidence.
@@ -182,6 +186,7 @@ pub async fn claim_relay_membership(
     let connection =
         observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    lock_nip43_membership(&mut tx, community).await?;
     let inserted = sqlx::query(
         "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
          VALUES ($1, $2, $3, 'invite') \
@@ -255,18 +260,21 @@ pub async fn remove_relay_member(
     community: CommunityId,
     pubkey: &str,
 ) -> Result<RemoveResult> {
-    let mut connection =
+    let connection =
         observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    lock_nip43_membership(&mut tx, community).await?;
     let result = sqlx::query(
         "DELETE FROM relay_members \
          WHERE community_id = $1 AND pubkey = $2 AND role <> 'owner'",
     )
     .bind(community.as_uuid())
     .bind(pubkey)
-    .execute(&mut *connection)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() > 0 {
+        tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
 
@@ -275,8 +283,9 @@ pub async fn remove_relay_member(
     let exists = sqlx::query("SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_optional(&mut *connection)
+        .fetch_optional(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     if exists.is_some() {
         Ok(RemoveResult::IsOwner)
@@ -304,18 +313,21 @@ pub async fn remove_relay_member_if_role(
     pubkey: &str,
     expected_role: &str,
 ) -> Result<RemoveResult> {
-    let mut connection =
+    let connection =
         observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    lock_nip43_membership(&mut tx, community).await?;
     let result = sqlx::query(
         "DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2 AND role = $3",
     )
     .bind(community.as_uuid())
     .bind(pubkey)
     .bind(expected_role)
-    .execute(&mut *connection)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() > 0 {
+        tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
 
@@ -324,8 +336,9 @@ pub async fn remove_relay_member_if_role(
     let row = sqlx::query("SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_optional(&mut *connection)
+        .fetch_optional(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     match row {
         None => Ok(RemoveResult::NotFound),
@@ -351,8 +364,10 @@ pub async fn update_relay_member_role(
     pubkey: &str,
     new_role: &str,
 ) -> Result<bool> {
-    let mut connection =
+    let connection =
         observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    lock_nip43_membership(&mut tx, community).await?;
     let result = sqlx::query(
         "UPDATE relay_members SET role = $1, updated_at = now() \
          WHERE community_id = $2 AND pubkey = $3 AND role <> 'owner'",
@@ -360,9 +375,11 @@ pub async fn update_relay_member_role(
     .bind(new_role)
     .bind(community.as_uuid())
     .bind(pubkey)
-    .execute(&mut *connection)
+    .execute(&mut *tx)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let updated = result.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(updated)
 }
 
 /// Ensures the configured owner pubkey holds the `"owner"` role *in
@@ -377,9 +394,11 @@ pub async fn update_relay_member_role(
 /// startup initialization and legacy operator provisioning
 /// (`community_provisioning.rs`). It is NOT an end-user path and does NOT
 /// enforce the per-owner community limit (`MAX_COMMUNITIES_PER_OWNER`) or
-/// acquire the per-recipient advisory lock. The per-owner limit is an
-/// end-user invariant enforced by `create_community_with_owner` and
-/// `transfer_ownership`; deployment-root operations may exceed it by design.
+/// acquire the per-recipient advisory lock. It does take the per-community
+/// kind:13534 membership lock so an owner rotation cannot commit under a Fleet
+/// roster confirmation. The per-owner limit is an end-user invariant enforced
+/// by `create_community_with_owner` and `transfer_ownership`; deployment-root
+/// operations may exceed it by design.
 pub async fn bootstrap_owner(
     pool: &PgPool,
     community: CommunityId,
@@ -403,6 +422,7 @@ async fn bootstrap_owner_with_operation(
     let pubkey = owner_pubkey.to_ascii_lowercase();
     let connection = observability::acquire_writer(pool, operation).await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    lock_nip43_membership(&mut tx, community).await?;
 
     // 1. Upsert the configured owner for this community.
     sqlx::query(
@@ -501,7 +521,8 @@ pub fn owner_count_advisory_lock_key(pubkey_hex: &str) -> i64 {
 /// 1. Acquires a transaction-scoped advisory lock on the *transferee* pubkey
 ///    so that concurrent transfers to the same recipient serialize. The same
 ///    lock key is also used by `Db::create_community_with_owner` to prevent
-///    transfer-vs-create races.
+///    transfer-vs-create races. That owner lock is taken before the
+///    per-community kind:13534 membership lock.
 /// 2. Locks the current owner row `FOR UPDATE` and verifies
 ///    `expected_owner_pubkey` matches. This prevents a stale-owner race where
 ///    a delayed/retried request overwrites a completed transfer.
@@ -534,6 +555,8 @@ pub async fn transfer_ownership(
             .execute(&mut *tx),
     )
     .await?;
+    // After the per-owner lock, before any relay_members row lock.
+    lock_nip43_membership(&mut tx, community).await?;
 
     // 2. Lock the current owner row FOR UPDATE and verify the expected owner.
     //    FOR UPDATE prevents the stale-owner race: a concurrent transfer that
@@ -624,30 +647,35 @@ pub async fn transfer_ownership(
 /// The empty-table guard prevents re-adding members that were intentionally
 /// removed by an admin after the initial backfill.
 pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> Result<u64> {
-    let mut connection =
+    let connection =
         observability::acquire_writer(pool, observability::WriterOperation::Bootstrap).await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    lock_nip43_membership(&mut tx, community).await?;
     // Check if pubkey_allowlist table exists.
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
          WHERE table_schema = 'public' AND table_name = 'pubkey_allowlist')",
     )
-    .fetch_one(&mut *connection)
+    .fetch_one(&mut *tx)
     .await?;
 
     if !exists {
+        tx.rollback().await?;
         return Ok(0);
     }
 
     // Only backfill if this community's relay_members is empty — once it has
     // rows (from a previous backfill or manual admin commands), we must not
-    // re-add members that were intentionally removed.
+    // re-add members that were intentionally removed. The check and insert
+    // share the membership lock so a concurrent removal cannot be undone.
     let has_members: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM relay_members WHERE community_id = $1)")
             .bind(community.as_uuid())
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut *tx)
             .await?;
 
     if has_members {
+        tx.rollback().await?;
         return Ok(0);
     }
 
@@ -659,10 +687,12 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
          ON CONFLICT (community_id, pubkey) DO NOTHING",
     )
     .bind(community.as_uuid())
-    .execute(&mut *connection)
+    .execute(&mut *tx)
     .await?;
+    let inserted = result.rows_affected();
+    tx.commit().await?;
 
-    Ok(result.rows_affected())
+    Ok(inserted)
 }
 
 /// One Fleet membership mutation applied under the kind:13534 advisory lock.
@@ -703,13 +733,52 @@ pub struct FleetMembershipConfirmation {
     pub published_event: Option<StoredEvent>,
 }
 
-fn nip43_membership_lock_key(community_id: CommunityId, relay_pubkey: &[u8]) -> i64 {
+/// One locked observation of a pubkey and the kind:13534 roster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nip43MembershipObservation {
+    /// Whether `pubkey` is in the locked member read.
+    pub present: bool,
+    /// Stored role from that read, when the row existed.
+    pub role: Option<String>,
+    /// The live kind:13534 snapshot matches that same member read.
+    pub roster_matches: bool,
+}
+
+/// Advisory-lock key for one community's authoritative `relay_members` set and
+/// its kind:13534 roster.
+///
+/// The member set is community-scoped, so the key does not include the relay
+/// signing pubkey. Writers such as invite, leave, and admin can take the same
+/// lock as roster publication without knowing that key. The fixed domain keeps
+/// the key in the replaceable-event lock family without colliding with a real
+/// author pubkey.
+pub fn nip43_membership_lock_key(community_id: CommunityId) -> i64 {
     replaceable::event_replacement_lock_key(
         community_id,
         buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32,
-        relay_pubkey,
+        b"buzz-nip43-membership",
         None,
     )
+}
+
+/// Serialize `relay_members` mutations and kind:13534 publication for one community.
+///
+/// `pg_advisory_xact_lock` is reentrant inside the transaction that acquires it
+/// and is released on commit or rollback. Callers must already own `tx`; this
+/// does not open a nested transaction. Take it before row locks. Operations that
+/// also take [`owner_count_advisory_lock_key`] take that owner lock first.
+pub(crate) async fn lock_nip43_membership(
+    tx: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+) -> Result<()> {
+    observability::observe_advisory_lock(
+        observability::LockType::Membership,
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(nip43_membership_lock_key(community_id))
+            .execute(&mut *tx),
+    )
+    .await?;
+    Ok(())
 }
 
 struct LockedMembershipView {
@@ -719,7 +788,8 @@ struct LockedMembershipView {
     snapshot_matches: bool,
 }
 
-async fn sync_fleet_membership_in_transaction<F, Fut>(
+#[allow(clippy::too_many_arguments)]
+async fn sync_fleet_membership_in_transaction<F, Fut, G, Gut>(
     mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
     community_id: CommunityId,
     pubkey: &str,
@@ -727,20 +797,16 @@ async fn sync_fleet_membership_in_transaction<F, Fut>(
     relay_keypair: &nostr::Keys,
     publish_roster: bool,
     before_absent_insert: F,
+    before_roster_commit: G,
 ) -> Result<FleetMembershipConfirmation>
 where
     F: FnOnce(String) -> Fut + Send,
     Fut: Future<Output = ()> + Send,
+    G: FnOnce(String) -> Gut + Send,
+    Gut: Future<Output = ()> + Send,
 {
     let pubkey_bytes = relay_keypair.public_key().to_bytes();
-    let lock_key = nip43_membership_lock_key(community_id, pubkey_bytes.as_slice());
-    observability::observe_advisory_lock(
-        observability::LockType::Membership,
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx),
-    )
-    .await?;
+    lock_nip43_membership(&mut tx, community_id).await?;
 
     if let Some(role) = apply_fleet_membership_mutation(
         &mut tx,
@@ -764,6 +830,7 @@ where
 
     let view =
         read_locked_membership_view(&mut tx, community_id, pubkey, pubkey_bytes.as_slice()).await?;
+    before_roster_commit(pubkey.to_owned()).await;
     if view.snapshot_matches || !publish_roster {
         tx.commit().await?;
         return Ok(FleetMembershipConfirmation {
@@ -1394,8 +1461,6 @@ impl Db {
         let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
         let pubkey_bytes = relay_keypair.public_key().to_bytes();
 
-        let lock_key = nip43_membership_lock_key(community_id, pubkey_bytes.as_slice());
-
         let (mut tx, transaction_timer) = observability::begin_transaction(
             &self.pool,
             observability::TransactionOperation::PublishNip43MembershipLocked,
@@ -1404,17 +1469,11 @@ impl Db {
         let (event, received_at, was_inserted, member_count) = transaction_timer
             .observe(async {
 
-        // Acquire the per-community snapshot lock BEFORE reading members.
-        // This serializes the entire read-build-write cycle: a concurrent
-        // publication will block here until our transaction commits, then
-        // read the updated membership state.
-        observability::observe_advisory_lock(
-            observability::LockType::Membership,
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(lock_key)
-                .execute(&mut *tx),
-        )
-        .await?;
+        // Acquire the per-community membership lock BEFORE reading members.
+        // This serializes the entire read-build-write cycle with every
+        // relay_members mutation: a concurrent publication or membership write
+        // blocks here until our transaction commits, then reads the updated set.
+        lock_nip43_membership(&mut tx, community_id).await?;
 
         // Read current members inside the locked transaction.
         let rows = sqlx::query(
@@ -1511,6 +1570,34 @@ impl Db {
         ))
     }
 
+    /// Read one pubkey and the kind:13534 roster under the membership lock.
+    ///
+    /// The member row and the live snapshot come from one statement, so a caller
+    /// cannot combine them across two membership generations. The transaction is
+    /// read-only and is rolled back after the observation.
+    #[datastore_span(name = "observe_nip43_membership", system = "postgresql")]
+    pub async fn observe_nip43_membership(
+        &self,
+        community_id: CommunityId,
+        pubkey: &str,
+        relay_pubkey: &[u8],
+    ) -> Result<Nip43MembershipObservation> {
+        let connection = observability::acquire_writer(
+            &self.pool,
+            observability::WriterOperation::Authorization,
+        )
+        .await?;
+        let mut tx = sqlx::Transaction::begin(connection, None).await?;
+        lock_nip43_membership(&mut tx, community_id).await?;
+        let view = read_locked_membership_view(&mut tx, community_id, pubkey, relay_pubkey).await?;
+        tx.rollback().await?;
+        Ok(Nip43MembershipObservation {
+            present: view.present,
+            role: view.role,
+            roster_matches: view.snapshot_matches,
+        })
+    }
+
     /// Apply one Fleet membership change and confirm kind:13534 under the same
     /// advisory lock roster publication already uses.
     ///
@@ -1524,7 +1611,8 @@ impl Db {
     /// back only that write and still commits the membership change, with
     /// [`FleetMembershipConfirmation::roster_published`] set to `false`.
     #[datastore_span(name = "sync_fleet_membership_and_roster", system = "postgresql")]
-    pub async fn sync_fleet_membership_and_roster<F, Fut>(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sync_fleet_membership_and_roster<F, Fut, G, Gut>(
         &self,
         community_id: CommunityId,
         pubkey: &str,
@@ -1532,10 +1620,13 @@ impl Db {
         relay_keypair: &nostr::Keys,
         publish_roster: bool,
         before_absent_insert: F,
+        before_roster_commit: G,
     ) -> Result<FleetMembershipConfirmation>
     where
         F: FnOnce(String) -> Fut + Send,
         Fut: Future<Output = ()> + Send,
+        G: FnOnce(String) -> Gut + Send,
+        Gut: Future<Output = ()> + Send,
     {
         let (tx, transaction_timer) = observability::begin_transaction(
             &self.pool,
@@ -1553,6 +1644,7 @@ impl Db {
                     relay_keypair,
                     publish_roster,
                     before_absent_insert,
+                    before_roster_commit,
                 )
                 .await
             })

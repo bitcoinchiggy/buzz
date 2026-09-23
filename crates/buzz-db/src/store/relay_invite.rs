@@ -232,6 +232,10 @@ pub async fn claim_relay_invite(
     )
     .await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    // Membership lock before the invite row lock. Fleet and other membership
+    // writers take this same lock and do not touch invite rows, so the order
+    // cannot invert.
+    crate::relay_members::lock_nip43_membership(&mut tx, community).await?;
 
     // 2. SELECT FOR UPDATE — lock the invite row for the duration of this txn.
     let row = sqlx::query(
