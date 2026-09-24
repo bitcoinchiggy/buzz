@@ -1269,371 +1269,374 @@ mod http_tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn add_new_member_publishes_roster() {
-        let host = format!("fleet-add-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let member = Keys::generate();
-        let (hex, body) = member_body(&member);
+    mod postgres_tests {
+        use super::*;
 
-        let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["present"], true);
-        assert_eq!(json["role"], "member");
-        assert_eq!(json["roster_published"], true);
-        assert_eq!(json["public_key_hex"], hex);
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn add_new_member_publishes_roster() {
+            let host = format!("fleet-add-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let member = Keys::generate();
+            let (hex, body) = member_body(&member);
 
-        let community = state
-            .db
-            .lookup_community_by_host(&host)
-            .await
-            .expect("lookup")
-            .expect("community")
-            .id;
-        let row = state
-            .db
-            .get_relay_member(community, &hex)
-            .await
-            .expect("get")
-            .expect("present");
-        assert_eq!(row.role, "member");
-        assert_eq!(row.added_by.as_deref(), Some(FLEET_ADDED_BY));
-        assert!(!state
-            .db
-            .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
-                community,
-                &state.relay_keypair.public_key(),
+            let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["present"], true);
+            assert_eq!(json["role"], "member");
+            assert_eq!(json["roster_published"], true);
+            assert_eq!(json["public_key_hex"], hex);
+
+            let community = state
+                .db
+                .lookup_community_by_host(&host)
+                .await
+                .expect("lookup")
+                .expect("community")
+                .id;
+            let row = state
+                .db
+                .get_relay_member(community, &hex)
+                .await
+                .expect("get")
+                .expect("present");
+            assert_eq!(row.role, "member");
+            assert_eq!(row.added_by.as_deref(), Some(FLEET_ADDED_BY));
+            assert!(!state
+                .db
+                .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
+                    community,
+                    &state.relay_keypair.public_key(),
+                )
+                .await
+                .expect("snapshot"));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn add_existing_member_is_idempotent() {
+            let host = format!("fleet-existing-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let member = Keys::generate();
+            let (hex, body) = member_body(&member);
+
+            let (first, _) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body.clone()).await;
+            assert_eq!(first, StatusCode::OK);
+            let (second, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
+            assert_eq!(second, StatusCode::OK);
+            assert_eq!(json["present"], true);
+            assert_eq!(json["roster_published"], true);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn remove_member_and_remove_already_absent() {
+            let host = format!("fleet-del-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let member = Keys::generate();
+            let (hex, body) = member_body(&member);
+
+            let (put, _) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body.clone()).await;
+            assert_eq!(put, StatusCode::OK);
+            let (deleted, json) = call(
+                state.clone(),
+                "DELETE",
+                &hex,
+                Some(TEST_TOKEN),
+                body.clone(),
             )
-            .await
-            .expect("snapshot"));
-    }
+            .await;
+            assert_eq!(deleted, StatusCode::OK, "{json}");
+            assert_eq!(json["present"], false);
+            assert_eq!(json["roster_published"], true);
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn add_existing_member_is_idempotent() {
-        let host = format!("fleet-existing-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let member = Keys::generate();
-        let (hex, body) = member_body(&member);
+            let (absent, json) = call(
+                state.clone(),
+                "DELETE",
+                &hex,
+                Some(TEST_TOKEN),
+                body.clone(),
+            )
+            .await;
+            assert_eq!(absent, StatusCode::OK);
+            assert_eq!(json["present"], false);
+            assert_eq!(json["roster_published"], true);
 
-        let (first, _) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body.clone()).await;
-        assert_eq!(first, StatusCode::OK);
-        let (second, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
-        assert_eq!(second, StatusCode::OK);
-        assert_eq!(json["present"], true);
-        assert_eq!(json["roster_published"], true);
-    }
+            let (get, json) = call(state, "GET", &hex, Some(TEST_TOKEN), body).await;
+            assert_eq!(get, StatusCode::OK);
+            assert_eq!(json["present"], false);
+            assert_eq!(json["roster_published"], true);
+        }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn remove_member_and_remove_already_absent() {
-        let host = format!("fleet-del-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let member = Keys::generate();
-        let (hex, body) = member_body(&member);
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn owner_and_admin_are_refused() {
+            let host = format!("fleet-owner-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let (owner_hex, owner_body) = member_body(&owner);
 
-        let (put, _) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body.clone()).await;
-        assert_eq!(put, StatusCode::OK);
-        let (deleted, json) = call(
-            state.clone(),
-            "DELETE",
-            &hex,
-            Some(TEST_TOKEN),
-            body.clone(),
-        )
-        .await;
-        assert_eq!(deleted, StatusCode::OK, "{json}");
-        assert_eq!(json["present"], false);
-        assert_eq!(json["roster_published"], true);
+            let (put_owner, json) = call(
+                state.clone(),
+                "PUT",
+                &owner_hex,
+                Some(TEST_TOKEN),
+                owner_body.clone(),
+            )
+            .await;
+            assert_eq!(put_owner, StatusCode::CONFLICT, "{json}");
+            let (del_owner, json) = call(
+                state.clone(),
+                "DELETE",
+                &owner_hex,
+                Some(TEST_TOKEN),
+                owner_body,
+            )
+            .await;
+            assert_eq!(del_owner, StatusCode::CONFLICT, "{json}");
+            assert_eq!(json["error"], "cannot remove relay owner");
 
-        let (absent, json) = call(
-            state.clone(),
-            "DELETE",
-            &hex,
-            Some(TEST_TOKEN),
-            body.clone(),
-        )
-        .await;
-        assert_eq!(absent, StatusCode::OK);
-        assert_eq!(json["present"], false);
-        assert_eq!(json["roster_published"], true);
-
-        let (get, json) = call(state, "GET", &hex, Some(TEST_TOKEN), body).await;
-        assert_eq!(get, StatusCode::OK);
-        assert_eq!(json["present"], false);
-        assert_eq!(json["roster_published"], true);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn owner_and_admin_are_refused() {
-        let host = format!("fleet-owner-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let (owner_hex, owner_body) = member_body(&owner);
-
-        let (put_owner, json) = call(
-            state.clone(),
-            "PUT",
-            &owner_hex,
-            Some(TEST_TOKEN),
-            owner_body.clone(),
-        )
-        .await;
-        assert_eq!(put_owner, StatusCode::CONFLICT, "{json}");
-        let (del_owner, json) = call(
-            state.clone(),
-            "DELETE",
-            &owner_hex,
-            Some(TEST_TOKEN),
-            owner_body,
-        )
-        .await;
-        assert_eq!(del_owner, StatusCode::CONFLICT, "{json}");
-        assert_eq!(json["error"], "cannot remove relay owner");
-
-        let admin = Keys::generate();
-        let community = state
-            .db
-            .lookup_community_by_host(&host)
-            .await
-            .expect("lookup")
-            .expect("community")
-            .id;
-        state
-            .db
-            .add_relay_member(community, &admin.public_key().to_hex(), "admin", None)
-            .await
-            .expect("add admin");
-        let (admin_hex, admin_body) = member_body(&admin);
-        let (put_admin, json) = call(
-            state.clone(),
-            "PUT",
-            &admin_hex,
-            Some(TEST_TOKEN),
-            admin_body.clone(),
-        )
-        .await;
-        assert_eq!(put_admin, StatusCode::CONFLICT, "{json}");
-        assert!(json["error"]
-            .as_str()
-            .unwrap()
-            .contains("cannot admit owner or admin"));
-
-        let (del_admin, json) = call(
-            state.clone(),
-            "DELETE",
-            &admin_hex,
-            Some(TEST_TOKEN),
-            admin_body,
-        )
-        .await;
-        assert_eq!(del_admin, StatusCode::CONFLICT, "{json}");
-        assert_eq!(json["error"], "cannot remove relay admin");
-
-        let owner_row = state
-            .db
-            .get_relay_member(community, &owner_hex)
-            .await
-            .expect("owner lookup")
-            .expect("owner row remains");
-        assert_eq!(owner_row.role, "owner");
-        let admin_row = state
-            .db
-            .get_relay_member(community, &admin_hex)
-            .await
-            .expect("admin lookup")
-            .expect("admin row remains");
-        assert_eq!(admin_row.role, "admin");
-    }
-
-    /// The first membership read can observe no row, and an owner/admin insert
-    /// can land before `INSERT … ON CONFLICT DO NOTHING`. HTTP 200 must not
-    /// report `role=member` for that elevated row.
-    ///
-    /// Production writers take the membership lock this PUT already holds, so
-    /// they cannot commit in the pause. The insert below is the residual
-    /// conflict path: a row that appears without that lock, before Fleet's
-    /// own insert. The re-read must still refuse it.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn put_loses_the_race_to_an_admin_insert_and_does_not_downgrade() {
-        let host = format!("fleet-race-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let admin = Keys::generate();
-        let (hex, body) = member_body(&admin);
-        let (handle, entered) = AdmitRaceHandle::arm(&hex);
-
-        let put_state = state.clone();
-        let put_hex = hex.clone();
-        let put =
-            tokio::spawn(
-                async move { call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await },
-            );
-        entered
-            .await
-            .expect("admit path must reach the absent-insert hook");
-
-        let community = state
-            .db
-            .lookup_community_by_host(&host)
-            .await
-            .expect("lookup")
-            .expect("community")
-            .id;
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
-            .await
-            .expect("admin insert pool");
-        let inserted = sqlx::query(
-            "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
-             VALUES ($1, $2, 'admin', NULL)",
-        )
-        .bind(community.as_uuid())
-        .bind(&hex)
-        .execute(&pool)
-        .await
-        .expect("insert admin during admit");
-        assert_eq!(
-            inserted.rows_affected(),
-            1,
-            "admin row must be the first insert"
-        );
-        handle.release_insert();
-
-        let (status, json) = put.await.expect("join");
-        assert_eq!(status, StatusCode::CONFLICT, "{json}");
-        assert_eq!(
-            json["error"],
-            "cannot admit owner or admin through the fleet membership API"
-        );
-        assert!(
-            json.get("role").is_none(),
-            "409 must not claim role=member: {json}"
-        );
-        let row = state
-            .db
-            .get_relay_member(community, &hex)
-            .await
-            .expect("get")
-            .expect("admin remains");
-        assert_eq!(row.role, "admin");
-        assert_ne!(row.added_by.as_deref(), Some(FLEET_ADDED_BY));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn publication_failure_after_db_mutation_returns_503() {
-        let host = format!("fleet-pubfail-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let member = Keys::generate();
-        let (hex, body) = member_body(&member);
-        let community = state
-            .db
-            .lookup_community_by_host(&host)
-            .await
-            .expect("lookup")
-            .expect("community")
-            .id;
-        let _guard = ForceRosterPublishFailure::arm(community);
-
-        let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
-        assert_eq!(json["roster_published"], false);
-        assert_eq!(json["present"], true);
-        assert_eq!(json["role"], "member");
-
-        assert!(
+            let admin = Keys::generate();
+            let community = state
+                .db
+                .lookup_community_by_host(&host)
+                .await
+                .expect("lookup")
+                .expect("community")
+                .id;
             state
                 .db
-                .is_relay_member(community, &hex)
+                .add_relay_member(community, &admin.public_key().to_hex(), "admin", None)
                 .await
-                .expect("member row persisted"),
-            "DB mutation must succeed even when roster publication fails"
-        );
-    }
+                .expect("add admin");
+            let (admin_hex, admin_body) = member_body(&admin);
+            let (put_admin, json) = call(
+                state.clone(),
+                "PUT",
+                &admin_hex,
+                Some(TEST_TOKEN),
+                admin_body.clone(),
+            )
+            .await;
+            assert_eq!(put_admin, StatusCode::CONFLICT, "{json}");
+            assert!(json["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot admit owner or admin"));
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn concurrent_membership_mutations_leave_roster_correct() {
-        let host = format!("fleet-conc-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
+            let (del_admin, json) = call(
+                state.clone(),
+                "DELETE",
+                &admin_hex,
+                Some(TEST_TOKEN),
+                admin_body,
+            )
+            .await;
+            assert_eq!(del_admin, StatusCode::CONFLICT, "{json}");
+            assert_eq!(json["error"], "cannot remove relay admin");
 
-        let members: Vec<Keys> = (0..8).map(|_| Keys::generate()).collect();
-        let mut tasks = Vec::new();
-        for keys in &members {
-            let (hex, body) = member_body(keys);
-            let state = state.clone();
-            let host = host.clone();
-            tasks.push(tokio::spawn(async move {
-                let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
-                assert_eq!(status, StatusCode::OK, "{json}");
-                assert_eq!(json["present"], true, "{json}");
-                assert_eq!(json["role"], "member", "{json}");
-                assert_eq!(json["roster_published"], true, "{json}");
-                assert_confirmed_member(&state, &host, &hex).await;
-                (status, json)
-            }));
+            let owner_row = state
+                .db
+                .get_relay_member(community, &owner_hex)
+                .await
+                .expect("owner lookup")
+                .expect("owner row remains");
+            assert_eq!(owner_row.role, "owner");
+            let admin_row = state
+                .db
+                .get_relay_member(community, &admin_hex)
+                .await
+                .expect("admin lookup")
+                .expect("admin row remains");
+            assert_eq!(admin_row.role, "admin");
         }
-        let mut statuses = Vec::new();
-        for task in tasks {
-            statuses.push(task.await.expect("join"));
-        }
 
-        let community = state
-            .db
-            .lookup_community_by_host(&host)
+        /// The first membership read can observe no row, and an owner/admin insert
+        /// can land before `INSERT … ON CONFLICT DO NOTHING`. HTTP 200 must not
+        /// report `role=member` for that elevated row.
+        ///
+        /// Production writers take the membership lock this PUT already holds, so
+        /// they cannot commit in the pause. The insert below is the residual
+        /// conflict path: a row that appears without that lock, before Fleet's
+        /// own insert. The re-read must still refuse it.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn put_loses_the_race_to_an_admin_insert_and_does_not_downgrade() {
+            let host = format!("fleet-race-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let admin = Keys::generate();
+            let (hex, body) = member_body(&admin);
+            let (handle, entered) = AdmitRaceHandle::arm(&hex);
+
+            let put_state = state.clone();
+            let put_hex = hex.clone();
+            let put = tokio::spawn(async move {
+                call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await
+            });
+            entered
+                .await
+                .expect("admit path must reach the absent-insert hook");
+
+            let community = state
+                .db
+                .lookup_community_by_host(&host)
+                .await
+                .expect("lookup")
+                .expect("community")
+                .id;
+            let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .unwrap_or_else(|_| TEST_DB_URL.to_string());
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .expect("admin insert pool");
+            let inserted = sqlx::query(
+                "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
+             VALUES ($1, $2, 'admin', NULL)",
+            )
+            .bind(community.as_uuid())
+            .bind(&hex)
+            .execute(&pool)
             .await
-            .expect("lookup")
-            .expect("community")
-            .id;
-        let listed = state
-            .db
-            .list_relay_members(community)
-            .await
-            .expect("list members");
-        for keys in &members {
-            let hex = keys.public_key().to_hex();
+            .expect("insert admin during admit");
+            assert_eq!(
+                inserted.rows_affected(),
+                1,
+                "admin row must be the first insert"
+            );
+            handle.release_insert();
+
+            let (status, json) = put.await.expect("join");
+            assert_eq!(status, StatusCode::CONFLICT, "{json}");
+            assert_eq!(
+                json["error"],
+                "cannot admit owner or admin through the fleet membership API"
+            );
             assert!(
-                listed
-                    .iter()
-                    .any(|row| row.pubkey == hex && row.role == "member"),
-                "missing member {hex}"
+                json.get("role").is_none(),
+                "409 must not claim role=member: {json}"
+            );
+            let row = state
+                .db
+                .get_relay_member(community, &hex)
+                .await
+                .expect("get")
+                .expect("admin remains");
+            assert_eq!(row.role, "admin");
+            assert_ne!(row.added_by.as_deref(), Some(FLEET_ADDED_BY));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn publication_failure_after_db_mutation_returns_503() {
+            let host = format!("fleet-pubfail-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let member = Keys::generate();
+            let (hex, body) = member_body(&member);
+            let community = state
+                .db
+                .lookup_community_by_host(&host)
+                .await
+                .expect("lookup")
+                .expect("community")
+                .id;
+            let _guard = ForceRosterPublishFailure::arm(community);
+
+            let (status, json) = call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+            assert_eq!(json["roster_published"], false);
+            assert_eq!(json["present"], true);
+            assert_eq!(json["role"], "member");
+
+            assert!(
+                state
+                    .db
+                    .is_relay_member(community, &hex)
+                    .await
+                    .expect("member row persisted"),
+                "DB mutation must succeed even when roster publication fails"
             );
         }
-        assert!(
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn concurrent_membership_mutations_leave_roster_correct() {
+            let host = format!("fleet-conc-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+
+            let members: Vec<Keys> = (0..8).map(|_| Keys::generate()).collect();
+            let mut tasks = Vec::new();
+            for keys in &members {
+                let (hex, body) = member_body(keys);
+                let state = state.clone();
+                let host = host.clone();
+                tasks.push(tokio::spawn(async move {
+                    let (status, json) =
+                        call(state.clone(), "PUT", &hex, Some(TEST_TOKEN), body).await;
+                    assert_eq!(status, StatusCode::OK, "{json}");
+                    assert_eq!(json["present"], true, "{json}");
+                    assert_eq!(json["role"], "member", "{json}");
+                    assert_eq!(json["roster_published"], true, "{json}");
+                    assert_confirmed_member(&state, &host, &hex).await;
+                    (status, json)
+                }));
+            }
+            let mut statuses = Vec::new();
+            for task in tasks {
+                statuses.push(task.await.expect("join"));
+            }
+
+            let community = state
+                .db
+                .lookup_community_by_host(&host)
+                .await
+                .expect("lookup")
+                .expect("community")
+                .id;
+            let listed = state
+                .db
+                .list_relay_members(community)
+                .await
+                .expect("list members");
+            for keys in &members {
+                let hex = keys.public_key().to_hex();
+                assert!(
+                    listed
+                        .iter()
+                        .any(|row| row.pubkey == hex && row.role == "member"),
+                    "missing member {hex}"
+                );
+            }
+            assert!(
             !state
                 .db
                 .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
@@ -1645,325 +1648,324 @@ mod http_tests {
             "roster drifted while concurrent admits were still returning 200; statuses={statuses:?}"
         );
 
-        let mut removals = Vec::new();
-        for keys in &members {
-            let (hex, body) = member_body(keys);
-            let state = state.clone();
-            let host = host.clone();
-            removals.push(tokio::spawn(async move {
-                let (status, json) =
-                    call(state.clone(), "DELETE", &hex, Some(TEST_TOKEN), body).await;
-                assert_eq!(status, StatusCode::OK, "{json}");
-                assert_eq!(json["present"], false, "{json}");
-                assert!(json["role"].is_null(), "{json}");
-                assert_eq!(json["roster_published"], true, "{json}");
-                assert_confirmed_absent(&state, &host, &hex).await;
-                (status, json)
-            }));
-        }
-        for task in removals {
-            statuses.push(task.await.expect("join"));
-        }
+            let mut removals = Vec::new();
+            for keys in &members {
+                let (hex, body) = member_body(keys);
+                let state = state.clone();
+                let host = host.clone();
+                removals.push(tokio::spawn(async move {
+                    let (status, json) =
+                        call(state.clone(), "DELETE", &hex, Some(TEST_TOKEN), body).await;
+                    assert_eq!(status, StatusCode::OK, "{json}");
+                    assert_eq!(json["present"], false, "{json}");
+                    assert!(json["role"].is_null(), "{json}");
+                    assert_eq!(json["roster_published"], true, "{json}");
+                    assert_confirmed_absent(&state, &host, &hex).await;
+                    (status, json)
+                }));
+            }
+            for task in removals {
+                statuses.push(task.await.expect("join"));
+            }
 
-        let listed = state
-            .db
-            .list_relay_members(community)
-            .await
-            .expect("list members");
-        for keys in &members {
-            let hex = keys.public_key().to_hex();
+            let listed = state
+                .db
+                .list_relay_members(community)
+                .await
+                .expect("list members");
+            for keys in &members {
+                let hex = keys.public_key().to_hex();
+                assert!(
+                    listed.iter().all(|row| row.pubkey != hex),
+                    "delete 200 left {hex} in relay_members"
+                );
+            }
             assert!(
-                listed.iter().all(|row| row.pubkey != hex),
-                "delete 200 left {hex} in relay_members"
+                listed.iter().any(|row| row.role == "owner"),
+                "concurrent deletes removed the owner"
             );
-        }
-        assert!(
-            listed.iter().any(|row| row.role == "owner"),
-            "concurrent deletes removed the owner"
-        );
 
-        let stale = state
-            .db
-            .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
-                community,
-                &state.relay_keypair.public_key(),
-            )
-            .await
-            .expect("snapshot compare");
-        assert!(
+            let stale = state
+                .db
+                .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
+                    community,
+                    &state.relay_keypair.public_key(),
+                )
+                .await
+                .expect("snapshot compare");
+            assert!(
             !stale,
             "authoritative kind:13534 snapshot must match membership after concurrent mutations; statuses={statuses:?}"
         );
-    }
+        }
 
-    /// Fleet confirmation holds the kind:13534 lock. A non-Fleet write of a
-    /// different member key must wait, and the 200 roster is the member set
-    /// from that locked read — not a snapshot already missing a committed
-    /// other-key mutation.
-    ///
-    /// Removing the lock from `add_relay_member` lets that insert commit while
-    /// the confirmation hook is still held, so the waiter never appears or the
-    /// other row is already visible. Confirming after the other key commits
-    /// puts that key in the snapshot this 200 stored.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn fleet_confirmation_blocks_other_key_membership_write() {
-        let host = format!("fleet-other-key-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let owner_hex = owner.public_key().to_hex();
-
-        let target = Keys::generate();
-        let (hex, body) = member_body(&target);
-        let other = Keys::generate();
-        let other_hex = other.public_key().to_hex();
-        assert_ne!(hex, other_hex);
-
-        let community = state
-            .db
-            .lookup_community_by_host(&host)
-            .await
-            .expect("lookup")
-            .expect("community")
-            .id;
-        let (handle, entered) = ConfirmRaceHandle::arm(&hex);
-
-        let put_state = state.clone();
-        let put_hex = hex.clone();
-        let put =
-            tokio::spawn(
-                async move { call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await },
-            );
-        entered
-            .await
-            .expect("roster confirmation must run while the membership lock is held");
-
-        let add_state = state.clone();
-        let add_hex = other_hex.clone();
-        let add = tokio::spawn(async move {
-            add_state
-                .db
-                .add_relay_member(community, &add_hex, "member", Some("admin"))
+        /// Fleet confirmation holds the kind:13534 lock. A non-Fleet write of a
+        /// different member key must wait, and the 200 roster is the member set
+        /// from that locked read — not a snapshot already missing a committed
+        /// other-key mutation.
+        ///
+        /// Removing the lock from `add_relay_member` lets that insert commit while
+        /// the confirmation hook is still held, so the waiter never appears or the
+        /// other row is already visible. Confirming after the other key commits
+        /// puts that key in the snapshot this 200 stored.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn fleet_confirmation_blocks_other_key_membership_write() {
+            let host = format!("fleet-other-key-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
                 .await
-        });
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let owner_hex = owner.public_key().to_hex();
 
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let locks = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
-            .await
-            .expect("lock observation pool");
-        wait_for_membership_waiter(
-            &locks,
-            buzz_db::relay_members::nip43_membership_lock_key(community),
-        )
-        .await;
+            let target = Keys::generate();
+            let (hex, body) = member_body(&target);
+            let other = Keys::generate();
+            let other_hex = other.public_key().to_hex();
+            assert_ne!(hex, other_hex);
 
-        let other_during_confirm = state
-            .db
-            .get_relay_member(community, &other_hex)
-            .await
-            .expect("other-key lookup during confirmation");
-        assert!(
-            other_during_confirm.is_none(),
-            "other-key membership committed outside the confirmation lock"
-        );
-        let target_during_confirm = state
-            .db
-            .get_relay_member(community, &hex)
-            .await
-            .expect("target lookup during confirmation");
-        assert!(
-            target_during_confirm.is_none(),
-            "fleet transaction committed before roster confirmation finished"
-        );
+            let community = state
+                .db
+                .lookup_community_by_host(&host)
+                .await
+                .expect("lookup")
+                .expect("community")
+                .id;
+            let (handle, entered) = ConfirmRaceHandle::arm(&hex);
 
-        handle.release_confirmation();
+            let put_state = state.clone();
+            let put_hex = hex.clone();
+            let put = tokio::spawn(async move {
+                call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await
+            });
+            entered
+                .await
+                .expect("roster confirmation must run while the membership lock is held");
 
-        let (status, json) = put.await.expect("join fleet put");
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["present"], true, "{json}");
-        assert_eq!(json["role"], "member", "{json}");
-        assert_eq!(json["roster_published"], true, "{json}");
-        let inserted = add.await.expect("join other-key add").expect("add");
-        assert!(inserted, "other-key insert must commit after the lock");
+            let add_state = state.clone();
+            let add_hex = other_hex.clone();
+            let add = tokio::spawn(async move {
+                add_state
+                    .db
+                    .add_relay_member(community, &add_hex, "member", Some("admin"))
+                    .await
+            });
 
-        let confirmed = live_snapshot_members(&state, community).await;
-        assert!(
-            confirmed
-                .iter()
-                .any(|(pubkey, role)| pubkey == &hex && role == "member"),
-            "200 roster missing the admitted key: {confirmed:?}"
-        );
-        assert!(
-            confirmed
-                .iter()
-                .any(|(pubkey, role)| pubkey == &owner_hex && role == "owner"),
-            "200 roster missing the owner: {confirmed:?}"
-        );
-        assert!(
-            confirmed.iter().all(|(pubkey, _)| pubkey != &other_hex),
-            "200 roster already contained the other key, so confirmation observed a committed mutation: {confirmed:?}"
-        );
-        assert!(
-            state
+            let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .unwrap_or_else(|_| TEST_DB_URL.to_string());
+            let locks = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .expect("lock observation pool");
+            wait_for_membership_waiter(
+                &locks,
+                buzz_db::relay_members::nip43_membership_lock_key(community),
+            )
+            .await;
+
+            let other_during_confirm = state
                 .db
                 .get_relay_member(community, &other_hex)
                 .await
-                .expect("other-key lookup after both")
-                .is_some(),
-            "other-key row must be committed once both calls return"
-        );
-
-        let (_event, was_inserted, _count) = state
-            .db
-            .publish_nip43_membership_locked(community, &state.relay_keypair)
-            .await
-            .expect("non-fleet follow-up roster publication");
-        assert!(
-            was_inserted,
-            "follow-up publication must replace the roster that predates the other key"
-        );
-        let drifted = state
-            .db
-            .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
-                community,
-                &state.relay_keypair.public_key(),
-            )
-            .await
-            .expect("snapshot compare");
-        assert!(
-            !drifted,
-            "relay_members and kind:13534 diverged after the serialized writes"
-        );
-        let agreed = live_snapshot_members(&state, community).await;
-        let mut expected = vec![
-            (owner_hex, "owner".to_string()),
-            (hex, "member".to_string()),
-            (other_hex, "member".to_string()),
-        ];
-        expected.sort();
-        assert_eq!(
-            agreed, expected,
-            "authoritative roster must list every committed member"
-        );
-    }
-
-    /// buzz-admin roster publication must wait on the Fleet confirmation lock
-    /// and read `relay_members` only after that lock is acquired. A snapshot
-    /// built from the pre-lock member set would omit the key Fleet has not
-    /// committed yet.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn admin_roster_publish_waits_for_fleet_membership_lock() {
-        let host = format!("fleet-admin-lock-{}.example", Uuid::new_v4().simple());
-        let state = postgres_state(&host)
-            .await
-            .expect("requires reachable Postgres");
-        let owner = Keys::generate();
-        bootstrap_owner(&state, &host, &owner).await;
-        let owner_hex = owner.public_key().to_hex();
-
-        let target = Keys::generate();
-        let (hex, body) = member_body(&target);
-        let community = state
-            .db
-            .lookup_community_by_host(&host)
-            .await
-            .expect("lookup")
-            .expect("community")
-            .id;
-        let (handle, entered) = ConfirmRaceHandle::arm(&hex);
-
-        let put_state = state.clone();
-        let put_hex = hex.clone();
-        let put =
-            tokio::spawn(
-                async move { call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await },
+                .expect("other-key lookup during confirmation");
+            assert!(
+                other_during_confirm.is_none(),
+                "other-key membership committed outside the confirmation lock"
             );
-        entered
-            .await
-            .expect("roster confirmation must hold the membership lock");
-
-        let publish_state = state.clone();
-        let publish = tokio::spawn(async move {
-            publish_state
-                .db
-                .publish_admin_nip43_membership_roster(community, &publish_state.relay_keypair)
-                .await
-        });
-
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let locks = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
-            .await
-            .expect("lock observation pool");
-        wait_for_membership_waiter(
-            &locks,
-            buzz_db::relay_members::nip43_membership_lock_key(community),
-        )
-        .await;
-        assert!(
-            state
+            let target_during_confirm = state
                 .db
                 .get_relay_member(community, &hex)
                 .await
-                .expect("target lookup during confirmation")
-                .is_none(),
-            "fleet member committed before buzz-admin blocked on the membership lock"
-        );
+                .expect("target lookup during confirmation");
+            assert!(
+                target_during_confirm.is_none(),
+                "fleet transaction committed before roster confirmation finished"
+            );
 
-        handle.release_confirmation();
+            handle.release_confirmation();
 
-        let (status, json) = put.await.expect("join fleet put");
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["present"], true, "{json}");
-        assert_eq!(json["roster_published"], true, "{json}");
-        let (stored, was_inserted, _count) = publish
-            .await
-            .expect("join buzz-admin publish")
-            .expect("buzz-admin roster publication");
-        assert!(
-            was_inserted,
-            "buzz-admin publication must replace the roster after the fleet lock"
-        );
+            let (status, json) = put.await.expect("join fleet put");
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["present"], true, "{json}");
+            assert_eq!(json["role"], "member", "{json}");
+            assert_eq!(json["roster_published"], true, "{json}");
+            let inserted = add.await.expect("join other-key add").expect("add");
+            assert!(inserted, "other-key insert must commit after the lock");
 
-        let listed = state
-            .db
-            .list_relay_members(community)
-            .await
-            .expect("list members");
-        let mut expected = listed
-            .into_iter()
-            .map(|member| (member.pubkey.to_ascii_lowercase(), member.role))
-            .collect::<Vec<_>>();
-        expected.sort();
-        assert!(
-            expected
-                .iter()
-                .any(|(pubkey, role)| pubkey == &hex && role == "member"),
-            "admitted key missing from relay_members: {expected:?}"
+            let confirmed = live_snapshot_members(&state, community).await;
+            assert!(
+                confirmed
+                    .iter()
+                    .any(|(pubkey, role)| pubkey == &hex && role == "member"),
+                "200 roster missing the admitted key: {confirmed:?}"
+            );
+            assert!(
+                confirmed
+                    .iter()
+                    .any(|(pubkey, role)| pubkey == &owner_hex && role == "owner"),
+                "200 roster missing the owner: {confirmed:?}"
+            );
+            assert!(
+            confirmed.iter().all(|(pubkey, _)| pubkey != &other_hex),
+            "200 roster already contained the other key, so confirmation observed a committed mutation: {confirmed:?}"
         );
-        assert!(
-            expected
-                .iter()
-                .any(|(pubkey, role)| pubkey == &owner_hex && role == "owner"),
-            "owner missing from relay_members: {expected:?}"
-        );
-        let agreed = live_snapshot_members(&state, community).await;
-        assert_eq!(
-            agreed, expected,
-            "buzz-admin published a roster that does not match relay_members; event={}",
-            stored.event.id
-        );
+            assert!(
+                state
+                    .db
+                    .get_relay_member(community, &other_hex)
+                    .await
+                    .expect("other-key lookup after both")
+                    .is_some(),
+                "other-key row must be committed once both calls return"
+            );
+
+            let (_event, was_inserted, _count) = state
+                .db
+                .publish_nip43_membership_locked(community, &state.relay_keypair)
+                .await
+                .expect("non-fleet follow-up roster publication");
+            assert!(
+                was_inserted,
+                "follow-up publication must replace the roster that predates the other key"
+            );
+            let drifted = state
+                .db
+                .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
+                    community,
+                    &state.relay_keypair.public_key(),
+                )
+                .await
+                .expect("snapshot compare");
+            assert!(
+                !drifted,
+                "relay_members and kind:13534 diverged after the serialized writes"
+            );
+            let agreed = live_snapshot_members(&state, community).await;
+            let mut expected = vec![
+                (owner_hex, "owner".to_string()),
+                (hex, "member".to_string()),
+                (other_hex, "member".to_string()),
+            ];
+            expected.sort();
+            assert_eq!(
+                agreed, expected,
+                "authoritative roster must list every committed member"
+            );
+        }
+
+        /// buzz-admin roster publication must wait on the Fleet confirmation lock
+        /// and read `relay_members` only after that lock is acquired. A snapshot
+        /// built from the pre-lock member set would omit the key Fleet has not
+        /// committed yet.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn admin_roster_publish_waits_for_fleet_membership_lock() {
+            let host = format!("fleet-admin-lock-{}.example", Uuid::new_v4().simple());
+            let state = postgres_state(&host)
+                .await
+                .expect("requires reachable Postgres");
+            let owner = Keys::generate();
+            bootstrap_owner(&state, &host, &owner).await;
+            let owner_hex = owner.public_key().to_hex();
+
+            let target = Keys::generate();
+            let (hex, body) = member_body(&target);
+            let community = state
+                .db
+                .lookup_community_by_host(&host)
+                .await
+                .expect("lookup")
+                .expect("community")
+                .id;
+            let (handle, entered) = ConfirmRaceHandle::arm(&hex);
+
+            let put_state = state.clone();
+            let put_hex = hex.clone();
+            let put = tokio::spawn(async move {
+                call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await
+            });
+            entered
+                .await
+                .expect("roster confirmation must hold the membership lock");
+
+            let publish_state = state.clone();
+            let publish = tokio::spawn(async move {
+                publish_state
+                    .db
+                    .publish_admin_nip43_membership_roster(community, &publish_state.relay_keypair)
+                    .await
+            });
+
+            let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .unwrap_or_else(|_| TEST_DB_URL.to_string());
+            let locks = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .expect("lock observation pool");
+            wait_for_membership_waiter(
+                &locks,
+                buzz_db::relay_members::nip43_membership_lock_key(community),
+            )
+            .await;
+            assert!(
+                state
+                    .db
+                    .get_relay_member(community, &hex)
+                    .await
+                    .expect("target lookup during confirmation")
+                    .is_none(),
+                "fleet member committed before buzz-admin blocked on the membership lock"
+            );
+
+            handle.release_confirmation();
+
+            let (status, json) = put.await.expect("join fleet put");
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["present"], true, "{json}");
+            assert_eq!(json["roster_published"], true, "{json}");
+            let (stored, was_inserted, _count) = publish
+                .await
+                .expect("join buzz-admin publish")
+                .expect("buzz-admin roster publication");
+            assert!(
+                was_inserted,
+                "buzz-admin publication must replace the roster after the fleet lock"
+            );
+
+            let listed = state
+                .db
+                .list_relay_members(community)
+                .await
+                .expect("list members");
+            let mut expected = listed
+                .into_iter()
+                .map(|member| (member.pubkey.to_ascii_lowercase(), member.role))
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert!(
+                expected
+                    .iter()
+                    .any(|(pubkey, role)| pubkey == &hex && role == "member"),
+                "admitted key missing from relay_members: {expected:?}"
+            );
+            assert!(
+                expected
+                    .iter()
+                    .any(|(pubkey, role)| pubkey == &owner_hex && role == "owner"),
+                "owner missing from relay_members: {expected:?}"
+            );
+            let agreed = live_snapshot_members(&state, community).await;
+            assert_eq!(
+                agreed, expected,
+                "buzz-admin published a roster that does not match relay_members; event={}",
+                stored.event.id
+            );
+        }
     }
 
     async fn live_snapshot_members(
