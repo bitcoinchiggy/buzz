@@ -280,14 +280,13 @@ async fn before_fleet_roster_commit(pubkey: String) {
     #[cfg(test)]
     {
         let release = {
-            let mut gate = CONFIRM_RACE_GATE
+            let mut gates = CONFIRM_RACE_GATES
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let matches = gate.as_ref().is_some_and(|armed| armed.pubkey == pubkey);
-            if !matches {
+            let Some(index) = gates.iter().position(|armed| armed.pubkey == pubkey) else {
                 return;
-            }
-            let armed = gate.take().expect("roster confirmation gate");
+            };
+            let armed = gates.swap_remove(index);
             let _ = armed.entered.send(());
             armed.release
         };
@@ -591,10 +590,12 @@ struct ConfirmRaceGate {
 }
 
 #[cfg(test)]
-static CONFIRM_RACE_GATE: std::sync::Mutex<Option<ConfirmRaceGate>> = std::sync::Mutex::new(None);
+static CONFIRM_RACE_GATES: std::sync::Mutex<Vec<ConfirmRaceGate>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 struct ConfirmRaceHandle {
+    pubkey: String,
     release: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -603,15 +604,18 @@ impl ConfirmRaceHandle {
     fn arm(pubkey: &str) -> (Self, tokio::sync::oneshot::Receiver<()>) {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *CONFIRM_RACE_GATE
+        let mut gates = CONFIRM_RACE_GATES
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(ConfirmRaceGate {
+            .unwrap_or_else(|poison| poison.into_inner());
+        gates.retain(|gate| gate.pubkey != pubkey);
+        gates.push(ConfirmRaceGate {
             pubkey: pubkey.to_owned(),
             entered: entered_tx,
             release: release_rx,
         });
         (
             Self {
+                pubkey: pubkey.to_owned(),
                 release: Some(release_tx),
             },
             entered_rx,
@@ -631,8 +635,8 @@ impl Drop for ConfirmRaceHandle {
         if let Some(release) = self.release.take() {
             let _ = release.send(());
         }
-        if let Ok(mut gate) = CONFIRM_RACE_GATE.lock() {
-            *gate = None;
+        if let Ok(mut gates) = CONFIRM_RACE_GATES.lock() {
+            gates.retain(|gate| gate.pubkey != self.pubkey);
         }
     }
 }
@@ -1500,7 +1504,9 @@ mod http_tests {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
             .await
             .expect("admin insert pool");
         let inserted = sqlx::query(
@@ -1747,7 +1753,9 @@ mod http_tests {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let locks = sqlx::PgPool::connect(&database_url)
+        let locks = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
             .await
             .expect("lock observation pool");
         wait_for_membership_waiter(
@@ -1843,6 +1851,118 @@ mod http_tests {
         assert_eq!(
             agreed, expected,
             "authoritative roster must list every committed member"
+        );
+    }
+
+    /// buzz-admin roster publication must wait on the Fleet confirmation lock
+    /// and read `relay_members` only after that lock is acquired. A snapshot
+    /// built from the pre-lock member set would omit the key Fleet has not
+    /// committed yet.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn admin_roster_publish_waits_for_fleet_membership_lock() {
+        let host = format!("fleet-admin-lock-{}.example", Uuid::new_v4().simple());
+        let state = postgres_state(&host)
+            .await
+            .expect("requires reachable Postgres");
+        let owner = Keys::generate();
+        bootstrap_owner(&state, &host, &owner).await;
+        let owner_hex = owner.public_key().to_hex();
+
+        let target = Keys::generate();
+        let (hex, body) = member_body(&target);
+        let community = state
+            .db
+            .lookup_community_by_host(&host)
+            .await
+            .expect("lookup")
+            .expect("community")
+            .id;
+        let (handle, entered) = ConfirmRaceHandle::arm(&hex);
+
+        let put_state = state.clone();
+        let put_hex = hex.clone();
+        let put =
+            tokio::spawn(
+                async move { call(put_state, "PUT", &put_hex, Some(TEST_TOKEN), body).await },
+            );
+        entered
+            .await
+            .expect("roster confirmation must hold the membership lock");
+
+        let publish_state = state.clone();
+        let publish = tokio::spawn(async move {
+            publish_state
+                .db
+                .publish_admin_nip43_membership_roster(community, &publish_state.relay_keypair)
+                .await
+        });
+
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_string());
+        let locks = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("lock observation pool");
+        wait_for_membership_waiter(
+            &locks,
+            buzz_db::relay_members::nip43_membership_lock_key(community),
+        )
+        .await;
+        assert!(
+            state
+                .db
+                .get_relay_member(community, &hex)
+                .await
+                .expect("target lookup during confirmation")
+                .is_none(),
+            "fleet member committed before buzz-admin blocked on the membership lock"
+        );
+
+        handle.release_confirmation();
+
+        let (status, json) = put.await.expect("join fleet put");
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["present"], true, "{json}");
+        assert_eq!(json["roster_published"], true, "{json}");
+        let (stored, was_inserted, _count) = publish
+            .await
+            .expect("join buzz-admin publish")
+            .expect("buzz-admin roster publication");
+        assert!(
+            was_inserted,
+            "buzz-admin publication must replace the roster after the fleet lock"
+        );
+
+        let listed = state
+            .db
+            .list_relay_members(community)
+            .await
+            .expect("list members");
+        let mut expected = listed
+            .into_iter()
+            .map(|member| (member.pubkey.to_ascii_lowercase(), member.role))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert!(
+            expected
+                .iter()
+                .any(|(pubkey, role)| pubkey == &hex && role == "member"),
+            "admitted key missing from relay_members: {expected:?}"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|(pubkey, role)| pubkey == &owner_hex && role == "owner"),
+            "owner missing from relay_members: {expected:?}"
+        );
+        let agreed = live_snapshot_members(&state, community).await;
+        assert_eq!(
+            agreed, expected,
+            "buzz-admin published a roster that does not match relay_members; event={}",
+            stored.event.id
         );
     }
 

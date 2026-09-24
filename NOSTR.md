@@ -338,7 +338,8 @@ but roster publication or snapshot confirmation fails, the response is 503 with
 and still returns success after a publication failure. Membership writes that
 change presence, role, or ownership take the same per-community lock as that
 roster confirmation, so a 200 cannot be built while another member key commits
-outside that window.
+outside that window. Relay and buzz-admin kind:13534 publication take that
+same lock and read `relay_members` only after it is held.
 
 After each add/remove/role-change, the relay publishes a kind:13534 membership list event
 (relay-signed, NIP-70 protected) that clients can subscribe to:
@@ -362,11 +363,11 @@ but only admins/owners can set it. Full spec:
    snapshot is the authoritative roster and rides Redis to live clients. Do not wire a delta call
    that passes in-process tests and silently no-ops in the deployed `compose exec` path.
 
-2. **The `custom_created_at = max(now, newest_existing_13534 + 1s)` bump defeats same-second
-   domination for serial invocations; it does NOT serialize concurrent CLI processes** — two
-   near-simultaneous adds can read the same newest timestamp and collide on the bumped second.
-   `run.sh` serialization is the guard against parallel adds (e.g. `xargs -P`). When adding
-   multiple members in a loop, add `sleep 1` between invocations.
+2. **Kind:13534 `created_at` is `max(now, newest stored snapshot + 1s)`**, including
+   soft-deleted rows. Relay publication, Fleet confirmation, and buzz-admin publication
+   compute that timestamp only after `nip43_membership_lock_key(community)` is held, so
+   concurrent replacements serialize and cannot reuse a primary key still occupied by a
+   same-second snapshot.
 
 ---
 

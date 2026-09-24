@@ -849,7 +849,7 @@ where
     match insert_nip43_snapshot_in_transaction(&mut tx, community_id, relay_keypair, &view.members)
         .await
     {
-        Ok(Some(stored)) => {
+        Ok((stored, true)) => {
             sqlx::query("RELEASE SAVEPOINT fleet_roster")
                 .execute(&mut *tx)
                 .await?;
@@ -863,7 +863,7 @@ where
                 published_event: Some(stored),
             })
         }
-        Ok(None) => {
+        Ok((_, false)) => {
             sqlx::query("ROLLBACK TO SAVEPOINT fleet_roster")
                 .execute(&mut *tx)
                 .await?;
@@ -1076,16 +1076,54 @@ fn snapshot_matches_members(
     snapshot_members == canonical
 }
 
+/// `created_at` for the next kind:13534 snapshot.
+///
+/// Soft-deleted rows keep the primary key `(community_id, created_at, id)`.
+/// A replacement whose member set matches one of those rows in the same Unix
+/// second would otherwise conflict and leave the live snapshot unchanged.
+/// The next timestamp is `max(now, newest stored snapshot + 1s)`, including
+/// replaced rows, and is only meaningful while the membership lock is held.
+async fn nip43_snapshot_created_at_secs(
+    tx: &mut sqlx::PgConnection,
+    community_id: CommunityId,
+    relay_pubkey: &[u8],
+) -> Result<u64> {
+    let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
+    let newest: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM events \
+         WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
+           AND channel_id IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(kind_i32)
+    .bind(relay_pubkey)
+    .fetch_one(&mut *tx)
+    .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(match newest {
+        Some(existing) => u64::try_from(existing.timestamp())
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(now),
+        None => now,
+    })
+}
+
 async fn insert_nip43_snapshot_in_transaction(
     tx: &mut sqlx::PgConnection,
     community_id: CommunityId,
     relay_keypair: &nostr::Keys,
     members: &[(String, String)],
-) -> Result<Option<StoredEvent>> {
+) -> Result<(StoredEvent, bool)> {
     use nostr::{EventBuilder, Kind, Tag};
 
     let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
     let pubkey_bytes = relay_keypair.public_key().to_bytes();
+    let created_at_secs =
+        nip43_snapshot_created_at_secs(tx, community_id, pubkey_bytes.as_slice()).await?;
     let mut tags: Vec<Tag> = Vec::with_capacity(members.len() + 1);
     tags.push(
         Tag::parse(["-"])
@@ -1100,6 +1138,7 @@ async fn insert_nip43_snapshot_in_transaction(
 
     let event = EventBuilder::new(Kind::Custom(kind_i32 as u16), "")
         .tags(tags)
+        .custom_created_at(nostr::Timestamp::from(created_at_secs))
         .sign_with_keys(relay_keypair)
         .map_err(|e| DbError::InvalidData(format!("failed to sign kind:13534: {e}")))?;
 
@@ -1142,15 +1181,11 @@ async fn insert_nip43_snapshot_in_transaction(
     .execute(&mut *tx)
     .await?;
 
-    if insert_result.rows_affected() == 0 {
-        return Ok(None);
-    }
-    Ok(Some(StoredEvent::with_received_at(
-        event,
-        received_at,
-        None,
-        true,
-    )))
+    let was_inserted = insert_result.rows_affected() > 0;
+    Ok((
+        StoredEvent::with_received_at(event, received_at, None, was_inserted),
+        was_inserted,
+    ))
 }
 
 impl Db {
@@ -1456,118 +1491,129 @@ impl Db {
         community_id: CommunityId,
         relay_keypair: &nostr::Keys,
     ) -> Result<(StoredEvent, bool, usize)> {
-        use nostr::{EventBuilder, Kind, Tag};
-
-        let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
-        let pubkey_bytes = relay_keypair.public_key().to_bytes();
-
         let (mut tx, transaction_timer) = observability::begin_transaction(
             &self.pool,
             observability::TransactionOperation::PublishNip43MembershipLocked,
         )
         .await?;
-        let (event, received_at, was_inserted, member_count) = transaction_timer
+        let (stored, was_inserted, member_count) = transaction_timer
             .observe(async {
+                // Acquire the per-community membership lock BEFORE reading members.
+                // This serializes the entire read-build-write cycle with every
+                // relay_members mutation: a concurrent publication or membership write
+                // blocks here until our transaction commits, then reads the updated set.
+                lock_nip43_membership(&mut tx, community_id).await?;
 
-        // Acquire the per-community membership lock BEFORE reading members.
-        // This serializes the entire read-build-write cycle with every
-        // relay_members mutation: a concurrent publication or membership write
-        // blocks here until our transaction commits, then reads the updated set.
-        lock_nip43_membership(&mut tx, community_id).await?;
-
-        // Read current members inside the locked transaction.
-        let rows = sqlx::query(
-            "SELECT pubkey, role FROM relay_members \
-             WHERE community_id = $1 ORDER BY created_at ASC",
-        )
-        .bind(community_id.as_uuid())
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let member_count = rows.len();
-
-        // Build the NIP-43 event from the locked member rows.
-        let mut tags: Vec<Tag> = Vec::with_capacity(member_count + 1);
-        // NIP-70 protected-event marker.
-        tags.push(Tag::parse(["-"]).map_err(|e| {
-            crate::error::DbError::InvalidData(format!("failed to build '-' tag: {e}"))
-        })?);
-        for row in &rows {
-            let pubkey: String = row.try_get("pubkey")?;
-            let role: String = row.try_get("role")?;
-            tags.push(Tag::parse(["member", &pubkey, &role]).map_err(|e| {
-                crate::error::DbError::InvalidData(format!("failed to build member tag: {e}"))
-            })?);
-        }
-
-        let event = EventBuilder::new(Kind::Custom(kind_i32 as u16), "")
-            .tags(tags)
-            .sign_with_keys(relay_keypair)
-            .map_err(|e| {
-                crate::error::DbError::InvalidData(format!("failed to sign kind:13534: {e}"))
-            })?;
-
-        let created_at_secs = event.created_at.as_secs() as i64;
-        let created_at = chrono::DateTime::from_timestamp(created_at_secs, 0)
-            .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
-        let sig_bytes = event.sig.serialize();
-        let tags_json = serde_json::to_value(&event.tags)?;
-        let received_at = chrono::Utc::now();
-        let d_tag = crate::event::extract_d_tag(&event);
-
-        // Soft-delete prior snapshots — unconditional, the relay is authoritative.
-        sqlx::query(
-            "UPDATE events SET deleted_at = NOW() \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
-             AND channel_id IS NULL \
-             AND deleted_at IS NULL",
-        )
-        .bind(community_id.as_uuid())
-        .bind(kind_i32)
-        .bind(pubkey_bytes.as_slice())
-        .execute(&mut *tx)
-        .await?;
-
-        let insert_result = sqlx::query(
-            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(community_id.as_uuid())
-        .bind(event.id.as_bytes().as_slice())
-        .bind(pubkey_bytes.as_slice())
-        .bind(created_at)
-        .bind(kind_i32)
-        .bind(&tags_json)
-        .bind(&event.content)
-        .bind(sig_bytes.as_slice())
-        .bind(received_at)
-        .bind::<Option<Uuid>>(None)
-        .bind(d_tag.as_deref())
-        .execute(&mut *tx)
-        .await?;
-
-        let was_inserted = insert_result.rows_affected() > 0;
-        if was_inserted {
-            tx.commit().await?;
-        } else {
-            tx.rollback().await?;
-        }
-        Ok::<_, DbError>((event, received_at, was_inserted, member_count))
+                // Read current members inside the locked transaction.
+                let rows = sqlx::query(
+                    "SELECT pubkey, role FROM relay_members \
+                     WHERE community_id = $1 ORDER BY created_at ASC",
+                )
+                .bind(community_id.as_uuid())
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut members = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let pubkey: String = row.try_get("pubkey")?;
+                    let role: String = row.try_get("role")?;
+                    members.push((pubkey, role));
+                }
+                let member_count = members.len();
+                let (stored, was_inserted) = insert_nip43_snapshot_in_transaction(
+                    &mut tx,
+                    community_id,
+                    relay_keypair,
+                    &members,
+                )
+                .await?;
+                if was_inserted {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                }
+                Ok::<_, DbError>((stored, was_inserted, member_count))
             })
             .await?;
 
         if was_inserted {
-            if let Err(e) = crate::insert_mentions(&self.pool, community_id, &event, None).await {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
+            if let Err(e) =
+                crate::insert_mentions(&self.pool, community_id, &stored.event, None).await
+            {
+                tracing::warn!(event_id = %stored.event.id, "Failed to insert mentions: {e}");
             }
         }
 
-        Ok((
-            StoredEvent::with_received_at(event, received_at, None, was_inserted),
-            was_inserted,
-            member_count,
-        ))
+        Ok((stored, was_inserted, member_count))
+    }
+
+    /// Publish the buzz-admin kind:13534 roster under the community membership lock.
+    ///
+    /// The membership mutation has already committed in its own transaction.
+    /// This opens a new transaction on one connection, takes
+    /// [`nip43_membership_lock_key`], and only then reads `relay_members`.
+    /// The replacement's `created_at` is `max(now, newest stored snapshot + 1s)`,
+    /// including soft-deleted rows, so a same-second prior event cannot dominate
+    /// the replacement or occupy its primary key. The snapshot write commits
+    /// before this method returns. Redis fan-out stays with the caller.
+    #[datastore_span(name = "publish_admin_nip43_membership_roster", system = "postgresql")]
+    pub async fn publish_admin_nip43_membership_roster(
+        &self,
+        community_id: CommunityId,
+        relay_keypair: &nostr::Keys,
+    ) -> Result<(StoredEvent, bool, usize)> {
+        let (mut tx, transaction_timer) = observability::begin_transaction(
+            &self.pool,
+            observability::TransactionOperation::PublishNip43MembershipLocked,
+        )
+        .await?;
+        let (stored, was_inserted, member_count) = transaction_timer
+            .observe(async {
+                lock_nip43_membership(&mut tx, community_id).await?;
+
+                let rows = sqlx::query(
+                    "SELECT pubkey, role FROM relay_members \
+                     WHERE community_id = $1 ORDER BY created_at ASC",
+                )
+                .bind(community_id.as_uuid())
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut members = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let pubkey: String = row.try_get("pubkey")?;
+                    let role: String = row.try_get("role")?;
+                    members.push((pubkey, role));
+                }
+                let member_count = members.len();
+                let (stored, was_inserted) = insert_nip43_snapshot_in_transaction(
+                    &mut tx,
+                    community_id,
+                    relay_keypair,
+                    &members,
+                )
+                .await?;
+                if was_inserted {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                }
+                Ok::<_, DbError>((stored, was_inserted, member_count))
+            })
+            .await?;
+
+        if was_inserted {
+            if let Err(e) =
+                crate::insert_mentions(&self.pool, community_id, &stored.event, None).await
+            {
+                tracing::warn!(event_id = %stored.event.id, "Failed to insert mentions: {e}");
+            }
+        }
+
+        if !was_inserted {
+            return Err(DbError::InvalidData(
+                "buzz-admin kind:13534 snapshot was not inserted".to_string(),
+            ));
+        }
+        Ok((stored, was_inserted, member_count))
     }
 
     /// Read one pubkey and the kind:13534 roster under the membership lock.
@@ -2083,5 +2129,167 @@ mod postgres_tests {
                 .role,
             "owner"
         );
+    }
+
+    /// A soft-deleted kind:13534 row keeps `(community_id, created_at, id)`.
+    /// Replacing that same roster in the occupied second must still insert a
+    /// newer snapshot. Removing the created_at bump makes Fleet report the
+    /// roster as unpublished, or leaves buzz-admin at the wall-clock second
+    /// instead of past the stored row.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn same_second_replaced_snapshot_does_not_block_roster_replacement() {
+        let pool = setup_pool().await;
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let db = Db::new(&crate::DbConfig {
+            database_url,
+            ..crate::DbConfig::default()
+        })
+        .await
+        .expect("db");
+        let community = make_test_community(&pool).await;
+        let owner = test_pubkey();
+        bootstrap_owner(&pool, community, &owner)
+            .await
+            .expect("bootstrap owner");
+        let keys = nostr::Keys::generate();
+        let owner_members = vec![(owner.clone(), "owner".to_string())];
+        let occupied_until =
+            seed_replaced_roster_window(&pool, community, &keys, &owner_members).await;
+
+        let absent = test_pubkey();
+        let confirmation = db
+            .sync_fleet_membership_and_roster(
+                community,
+                &absent,
+                FleetMembershipMutation::RemoveMember,
+                &keys,
+                true,
+                |_| std::future::ready(()),
+                |_| std::future::ready(()),
+            )
+            .await
+            .expect("fleet roster replacement");
+        assert!(!confirmation.present);
+        assert!(
+            confirmation.roster_published,
+            "same-second primary key must not turn a committed removal into a failed roster"
+        );
+        let published = confirmation
+            .published_event
+            .expect("published fleet snapshot")
+            .event
+            .created_at
+            .as_secs();
+        assert!(
+            published > occupied_until,
+            "fleet snapshot created_at {published} did not move past the stored row {occupied_until}"
+        );
+
+        let extra = test_pubkey();
+        assert!(add_relay_member(&pool, community, &extra, "member", None)
+            .await
+            .expect("add member"));
+        let mut with_member = member_rows(&pool, community).await;
+        let occupied_until =
+            seed_replaced_roster_window(&pool, community, &keys, &with_member).await;
+        let (stored, was_inserted, member_count) = db
+            .publish_admin_nip43_membership_roster(community, &keys)
+            .await
+            .expect("buzz-admin roster replacement");
+        assert!(was_inserted);
+        assert_eq!(member_count, with_member.len());
+        let published = stored.event.created_at.as_secs();
+        assert!(
+            published > occupied_until,
+            "buzz-admin snapshot created_at {published} did not move past the stored row {occupied_until}"
+        );
+        with_member.sort();
+        let mut snapshot_members = stored
+            .event
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                let parts = tag.as_slice();
+                (parts.first().map(String::as_str) == Some("member") && parts.len() >= 3)
+                    .then(|| (parts[1].clone(), parts[2].clone()))
+            })
+            .collect::<Vec<_>>();
+        snapshot_members.sort();
+        assert_eq!(snapshot_members, with_member);
+    }
+
+    async fn member_rows(pool: &PgPool, community: CommunityId) -> Vec<(String, String)> {
+        let rows = sqlx::query(
+            "SELECT pubkey, role FROM relay_members \
+             WHERE community_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(community.as_uuid())
+        .fetch_all(pool)
+        .await
+        .expect("list members in roster order");
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.try_get("pubkey").expect("pubkey"),
+                    row.try_get("role").expect("role"),
+                )
+            })
+            .collect()
+    }
+
+    /// Insert soft-deleted snapshots for `members` at the current second and
+    /// one thousand seconds ahead. Returns the latest seeded `created_at`.
+    async fn seed_replaced_roster_window(
+        pool: &PgPool,
+        community: CommunityId,
+        keys: &nostr::Keys,
+        members: &[(String, String)],
+    ) -> u64 {
+        use nostr::{EventBuilder, Kind, Tag};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let kind = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
+        let mut tags = Vec::with_capacity(members.len() + 1);
+        tags.push(Tag::parse(["-"]).expect("dash tag"));
+        for (pubkey, role) in members {
+            tags.push(Tag::parse(["member", pubkey, role]).expect("member tag"));
+        }
+        let mut latest = now;
+        for created_at_secs in [now, now + 1, now + 2, now + 1_000] {
+            latest = created_at_secs;
+            let event = EventBuilder::new(Kind::Custom(kind as u16), "")
+                .tags(tags.clone())
+                .custom_created_at(nostr::Timestamp::from(created_at_secs))
+                .sign_with_keys(keys)
+                .expect("sign seeded snapshot");
+            let created_at = chrono::DateTime::from_timestamp(created_at_secs as i64, 0)
+                .expect("seed timestamp");
+            let pubkey = keys.public_key().to_bytes();
+            let sig = event.sig.serialize();
+            let tags_json = serde_json::to_value(&event.tags).expect("tags");
+            sqlx::query(
+                "INSERT INTO events \
+                 (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, deleted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NULL, NOW())",
+            )
+            .bind(community.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .bind(pubkey.as_slice())
+            .bind(created_at)
+            .bind(kind as i32)
+            .bind(&tags_json)
+            .bind(&event.content)
+            .bind(sig.as_slice())
+            .execute(pool)
+            .await
+            .expect("insert soft-deleted snapshot");
+        }
+        latest
     }
 }

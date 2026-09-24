@@ -14,11 +14,12 @@
 //!
 //! ## Same-second domination guard
 //!
-//! The `custom_created_at = max(now, newest_existing_13534 + 1s)` bump defeats
-//! same-second domination for serial invocations; it does NOT serialize
-//! concurrent CLI processes — two near-simultaneous adds can read the same
-//! newest timestamp and collide on the bumped second. run.sh serialization is
-//! the guard against parallel adds (e.g. `xargs -P`).
+//! Roster publication takes the community kind:13534 membership lock, re-reads
+//! `relay_members`, and replaces the snapshot in that same transaction.
+//! `created_at` is `max(now, newest stored kind:13534 + 1s)`, including
+//! replaced rows, computed after that lock is held. A same-second prior event
+//! cannot dominate the replacement or keep its primary key. The membership
+//! change itself commits before that publication starts.
 
 mod deletions;
 mod storage_snapshot_startup;
@@ -29,7 +30,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
 use buzz_core::tenant::{relay_url_authority, TenantContext};
 use buzz_db::{Db, DbConfig};
 use buzz_media::{BucketSnapshot, MediaConfig, MediaStorage, S3AddressingStyle, SweepError};
@@ -465,62 +465,19 @@ fn parse_pubkey_hex(input: &str) -> std::result::Result<String, String> {
         .map_err(|e| format!("invalid pubkey '{input}': {e}"))
 }
 
-/// Publish kind:13534 with `custom_created_at = max(now, newest_existing + 1s)`.
+/// Publish kind:13534 after a committed membership change.
 ///
-/// Guarantees the new event is not dominated by a same-second prior invocation,
-/// so `replace_addressable_event` always inserts and dispatches to Redis.
-///
-/// See module-level doc for the TOCTOU caveat on concurrent CLI processes.
+/// The database method takes the community membership lock, re-reads members,
+/// bumps `created_at` past every stored kind:13534 snapshot, and replaces the
+/// roster before returning. Redis fan-out happens only after that commit.
 async fn publish_membership_list_with_bump(
     db: &Db,
     pubsub: &Arc<PubSubManager>,
     relay_keypair: &Keys,
     tenant: &TenantContext,
 ) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let relay_pubkey = relay_keypair.public_key();
-    let relay_pubkey_bytes = relay_pubkey.to_bytes();
-
-    // Query the newest existing kind:13534 for this relay's pubkey (channel_id=None).
-    let newest_ts = db
-        .get_latest_global_replaceable(
-            tenant.community(),
-            KIND_NIP43_MEMBERSHIP_LIST as i32,
-            &relay_pubkey_bytes,
-        )
-        .await?
-        .map(|e| e.event.created_at.as_secs());
-
-    // custom_created_at = max(now, existing + 1s) — defeats same-second domination.
-    let ts = match newest_ts {
-        Some(existing) => (existing + 1).max(now),
-        None => now,
-    };
-
-    let members = db.list_relay_members(tenant.community()).await?;
-
-    let mut tags: Vec<Tag> = Vec::with_capacity(members.len() + 1);
-    // NIP-70 protected-event marker — prevents re-broadcasting by third parties.
-    tags.push(Tag::parse(["-"]).map_err(|e| anyhow::anyhow!("failed to build '-' tag: {e}"))?);
-    for member in &members {
-        tags.push(
-            Tag::parse(["member", &member.pubkey, &member.role])
-                .map_err(|e| anyhow::anyhow!("failed to build member tag: {e}"))?,
-        );
-    }
-
-    let event = EventBuilder::new(Kind::Custom(KIND_NIP43_MEMBERSHIP_LIST as u16), "")
-        .tags(tags)
-        .custom_created_at(nostr::Timestamp::from(ts))
-        .sign_with_keys(relay_keypair)
-        .map_err(|e| anyhow::anyhow!("failed to sign kind:13534: {e}"))?;
-
-    let (stored, was_inserted) = db
-        .replace_addressable_event(tenant.community(), &event, None)
+    let (stored, was_inserted, member_count) = db
+        .publish_admin_nip43_membership_roster(tenant.community(), relay_keypair)
         .await?;
     if was_inserted {
         // Publish to Redis so live clients receive the updated roster.
@@ -535,8 +492,8 @@ async fn publish_membership_list_with_bump(
     }
 
     tracing::info!(
-        member_count = members.len(),
-        ts,
+        member_count,
+        ts = stored.event.created_at.as_secs(),
         "NIP-43 membership list published by buzz-admin"
     );
     Ok(())
