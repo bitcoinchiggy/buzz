@@ -871,7 +871,9 @@ mod http_tests {
 
         let pool = sqlx::PgPool::connect(&database_url).await.ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.ok()?;
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate().await.ok()?;
+        }
         db.ensure_configured_community(host).await.ok()?;
 
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
