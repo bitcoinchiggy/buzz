@@ -425,6 +425,8 @@ pub(crate) async fn run_demo_echo(
     // before its Redis fence await, so dropping that future discards the
     // frame and the forwarder waits out its echo timeout. Pin the receive
     // future and race `&mut` it so a drain tick cannot cancel the read.
+    // Fork-only relative to upstream d56ed754; removal conditions are in
+    // `docs/fork-mesh-demo-echo.md`.
     loop {
         // The pinned future borrows `stream` for the whole read. End that
         // scope before any drain close, which needs `stream` again.
