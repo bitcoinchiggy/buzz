@@ -165,9 +165,115 @@ pub struct MeshHandle {
     /// [`Self::wire_consumers`]) so inbound control loops fan that renewer's
     /// owner-loss signal. One registry per pod; single source of owner truth.
     pub owners: Arc<crate::audio::join::HuddleOwnerRegistry>,
+
+    /// Test-only directory seam. When `Some`, `effective_directory` returns
+    /// this `Arc<dyn HuddleDirectory>` instead of `self.directory`, so handler
+    /// tests can inject a `FakeDir` without a live Redis connection.
+    ///
+    /// Production code never sets this field. Use `for_test_only` to build a
+    /// handle with an injected directory, and `effective_directory` where the
+    /// real handler reads the directory.
+    #[cfg(test)]
+    pub(crate) test_directory: Option<Arc<dyn crate::audio::join::HuddleDirectory>>,
 }
 
 impl MeshHandle {
+    /// The effective directory for `resolve_join_owner_ready`.
+    ///
+    /// In production, always `&self.directory`. In test builds, returns the
+    /// injected `test_directory` when present — this makes the B1 caller
+    /// witness possible without a live Redis connection.
+    pub(crate) fn effective_directory(&self) -> &dyn crate::audio::join::HuddleDirectory {
+        #[cfg(test)]
+        if let Some(d) = &self.test_directory {
+            return d.as_ref();
+        }
+        &self.directory
+    }
+
+    /// Construct a minimal `MeshHandle` for handler tests that need a live
+    /// mesh (e.g. to reach the B1 owner-release path) without a Redis
+    /// connection. The caller must call [`Self::with_test_directory`] afterwards
+    /// to inject a fake directory — construction is split so the caller can
+    /// use `self.local_runtime_id` to build the scripted directory.
+    ///
+    /// The returned handle installs no inbound consumers; background loops
+    /// bind on loopback and run idle (no peers are dialed).
+    #[cfg(test)]
+    pub(crate) async fn for_test_only(
+        owners: Arc<crate::audio::join::HuddleOwnerRegistry>,
+    ) -> Self {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use buzz_relay_mesh::gossip::GossipRecord;
+
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let endpoint = buzz_relay_mesh::endpoint::MeshEndpoint::bind(loopback)
+            .await
+            .expect("for_test_only: loopback endpoint");
+        let runtime_id = endpoint.runtime_id();
+        let record = GossipRecord::new(runtime_id, vec![], 1);
+        let membership = MeshMembership::new(record);
+        let runtime = MeshRuntime::start(endpoint, membership.clone(), None);
+        let membership_arc: Arc<dyn RelayMeshMembership> = Arc::new(membership);
+
+        struct NoopTransport;
+        impl RelayPeerTransport for NoopTransport {
+            fn send_datagram(
+                &self,
+                _to: RuntimeId,
+                _dgram: MeshDatagram,
+            ) -> Result<(), buzz_relay_mesh::MeshError> {
+                Ok(())
+            }
+            fn open_session_stream(
+                &self,
+                _to: RuntimeId,
+                _hello: StreamHello,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<MeshStream, buzz_relay_mesh::MeshError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(buzz_relay_mesh::MeshError::Transport("noop".into())) })
+            }
+            fn set_inbound(&self, _handler: Box<dyn InboundHandler>) {}
+        }
+
+        let transport: Arc<dyn RelayPeerTransport> = Arc::new(NoopTransport);
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1") // never dialed
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("for_test_only: noop redis pool");
+
+        MeshHandle {
+            directory: SessionDirectory::new(pool),
+            transport,
+            membership: membership_arc,
+            local_runtime_id: runtime_id,
+            dispatcher: MeshInboundDispatcher::default(),
+            audio_fence: Arc::new(crate::audio::mesh::GenerationFloor::new()),
+            runtime,
+            owners,
+            test_directory: None,
+        }
+    }
+
+    /// Inject a scripted [`HuddleDirectory`] into this handle so that
+    /// [`Self::effective_directory`] returns it. Call after [`Self::for_test_only`]
+    /// once you have `self.local_runtime_id` to build the scripted directory.
+    ///
+    /// [`HuddleDirectory`]: crate::audio::join::HuddleDirectory
+    #[cfg(test)]
+    pub(crate) fn with_test_directory(
+        mut self,
+        directory: Arc<dyn crate::audio::join::HuddleDirectory>,
+    ) -> Self {
+        self.test_directory = Some(directory);
+        self
+    }
+
     /// Live `/_mesh` status snapshot.
     pub fn status(&self) -> MeshStatus {
         self.runtime.membership().status()
@@ -314,25 +420,44 @@ pub(crate) async fn run_demo_echo(
     let mut stream = inbound.stream;
     tracing::info!(%session_id, %peer, "mesh demo echo: session open");
     let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    // `interval` is ready on its first tick, and `select!` drops every branch
+    // it does not take. `recv_validated` pulls the QUIC frame off the stream
+    // before its Redis fence await, so dropping that future discards the
+    // frame and the forwarder waits out its echo timeout. Pin the receive
+    // future and race `&mut` it so a drain tick cannot cancel the read.
+    // Fork-only relative to upstream d56ed754; removal conditions are in
+    // `docs/fork-mesh-demo-echo.md`.
     loop {
-        let frame = tokio::select! {
-            _ = drain_tick.tick() => {
-                if shutting_down.load(Ordering::Relaxed) {
-                    if let Some(community_id) = stream.community_id() {
-                        if let Err(e) = stream.send_goodbye(community_id, GoodbyeReason::Draining).await {
-                            tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
-                        } else {
-                            tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+        // The pinned future borrows `stream` for the whole read. End that
+        // scope before any drain close, which needs `stream` again.
+        let frame = {
+            let mut recv = std::pin::pin!(stream.recv_validated(&directory));
+            loop {
+                tokio::select! {
+                    _ = drain_tick.tick() => {
+                        if shutting_down.load(Ordering::Relaxed) {
+                            break None;
                         }
-                    } else {
-                        let _ = stream.finish();
-                        tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
                     }
-                    return;
+                    frame = &mut recv => break Some(frame),
                 }
-                continue;
             }
-            frame = stream.recv_validated(&directory) => frame,
+        };
+        let Some(frame) = frame else {
+            if let Some(community_id) = stream.community_id() {
+                if let Err(e) = stream
+                    .send_goodbye(community_id, GoodbyeReason::Draining)
+                    .await
+                {
+                    tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
+                } else {
+                    tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+                }
+            } else {
+                let _ = stream.finish();
+                tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
+            }
+            return;
         };
         match frame {
             Ok(Some(ReliableFrame::Data(payload))) => {
@@ -368,11 +493,12 @@ const PROTO_VERSION: u16 = buzz_relay_mesh::WIRE_VERSION as u16;
 
 /// Capabilities advertised by this build. All three tunnel profiles ship in
 /// the same binary, so the list is static.
-fn capabilities() -> Vec<String> {
+pub(crate) fn capabilities() -> Vec<String> {
     vec![
         "reliable-stream".to_string(),
         "realtime-media".to_string(),
         "huddle-control".to_string(),
+        crate::audio::join::HUDDLE_COMMIT_PHASE_CAPABILITY.to_string(),
     ]
 }
 
@@ -462,8 +588,8 @@ pub async fn boot_mesh(
         .map_err(|e| anyhow::anyhow!("mesh ready-registry publish failed: {e}"))?;
     tracing::info!(runtime_id = %runtime_id, "mesh ready record published");
 
-    // Readiness-gated heartbeat: publishes while the relay would pass
-    // readiness, clears the record on ready→not-ready and on shutdown.
+    // The heartbeat is shutdown-gated only. Readiness terms deliberately do
+    // not gate mesh publication; shutdown clears the record.
     let hb_flag = Arc::clone(&shutting_down);
     buzz_relay_mesh::runtime::spawn_registry_heartbeat(
         registry.clone(),
@@ -517,6 +643,8 @@ pub async fn boot_mesh(
         audio_fence: Arc::new(crate::audio::mesh::GenerationFloor::new()),
         runtime,
         owners,
+        #[cfg(test)]
+        test_directory: None,
     }))
 }
 
@@ -530,7 +658,7 @@ mod tests {
     /// ever reached Redis this test would hang/fail.
     #[tokio::test]
     async fn mesh_off_boots_nothing() {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.mesh.enabled = false;
         let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1") // unroutable
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
@@ -539,7 +667,7 @@ mod tests {
         let db = buzz_db::Db::from_pool(
             sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
-                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused") // sadscan:disable np.postgres.1
                 .expect("lazy database pool"),
         );
         let handle = boot_mesh(&config, pool, db, &keys, Arc::new(AtomicBool::new(false)))
@@ -557,7 +685,7 @@ mod tests {
         if std::env::var("BUZZ_MESH").is_ok() {
             return; // externally forced — skip rather than assert a lie
         }
-        let config = crate::config::Config::from_env().expect("default config loads");
+        let config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         assert!(!config.mesh.enabled, "BUZZ_MESH absent must mean mesh off");
     }
 
@@ -753,5 +881,177 @@ mod tests {
             fence.check(session, 1),
             crate::audio::mesh::FenceVerdict::Accept { .. }
         ));
+    }
+
+    /// A drain tick that fires while `recv_validated` is in flight must not
+    /// drop that future. The receive half below takes the only frame, then
+    /// waits longer than the 100ms drain period before yielding it. The old
+    /// `select!` dropped the future on that tick, the next read observed a
+    /// lost frame, and nothing was echoed.
+    #[tokio::test]
+    async fn demo_echo_drain_tick_does_not_drop_in_flight_frame() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let pool = deadpool_redis::Config::from_url(url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let mut conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        if redis::cmd("PING")
+            .query_async::<String>(&mut *conn)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        drop(conn);
+
+        let directory = SessionDirectory::with_lease_ttl(pool, std::time::Duration::from_secs(5));
+        let owner = rid(9);
+        let community_id = buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let session_id = uuid::Uuid::new_v4();
+        let lease = match directory
+            .acquire(community_id, session_id, owner, Profile::ReliableStream)
+            .await
+            .expect("acquire lease")
+        {
+            crate::tunnel::directory::AcquireResult::Acquired(lease) => lease,
+            crate::tunnel::directory::AcquireResult::Exists(_) => {
+                panic!("fresh session must acquire")
+            }
+        };
+        let fenced = lease.fenced_header();
+        let mut wire = Vec::with_capacity(18 + 18);
+        wire.push(1);
+        wire.push(1);
+        wire.extend_from_slice(community_id.as_uuid().as_bytes());
+        wire.extend_from_slice(b"mesh echo evidence");
+
+        let phase = Arc::new(Mutex::new(0u8));
+        let pending = Arc::new(Mutex::new(Some(MeshStreamFrame::Data {
+            fenced,
+            payload: wire,
+        })));
+        let echoed = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let inbound = ReliableInbound {
+            fenced,
+            from: rid(4),
+            stream: crate::tunnel::reliable::ReliableMeshStream::new_inbound(
+                fenced,
+                MeshStream::new(
+                    Box::new(RecordingSend {
+                        frames: Arc::clone(&echoed),
+                    }),
+                    Box::new(PausingRecv { phase, pending }),
+                ),
+            ),
+        };
+
+        let task = tokio::spawn(run_demo_echo(
+            directory,
+            inbound,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let echoed_payload = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(payload) = echoed.lock().expect("echoed").first().cloned() {
+                    return payload;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        task.abort();
+        let payload = echoed_payload.expect("drain tick dropped the in-flight echo frame");
+        assert!(
+            payload.ends_with(b"mesh echo evidence"),
+            "echoed payload {payload:?}"
+        );
+    }
+
+    /// Shutdown observed on the drain tick closes the stream without waiting
+    /// for a frame. The receive future stays pinned across that tick, so this
+    /// guards the close path against staying borrowed.
+    #[tokio::test]
+    async fn demo_echo_drain_tick_closes_when_shutting_down() {
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let directory = SessionDirectory::with_lease_ttl(pool, std::time::Duration::from_secs(5));
+        let fenced = FencedHeader {
+            session_id: uuid::Uuid::nil(),
+            generation: 1,
+            owner_runtime_id: rid(9),
+        };
+        let inbound = ReliableInbound {
+            fenced,
+            from: rid(4),
+            stream: crate::tunnel::reliable::ReliableMeshStream::new_inbound(
+                fenced,
+                MeshStream::new(Box::new(StubSend), Box::new(PendingRecv)),
+            ),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_demo_echo(directory, inbound, Arc::new(AtomicBool::new(true))),
+        )
+        .await
+        .expect("drain tick did not close the echo loop");
+    }
+
+    struct PendingRecv;
+
+    impl StreamRecvHalf for PendingRecv {
+        fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Delivers one frame only if the in-flight read is polled to completion.
+    /// A drop while `phase == 1` loses the frame, matching a QUIC read that
+    /// `select!` cancelled after bytes were already consumed.
+    struct PausingRecv {
+        phase: Arc<Mutex<u8>>,
+        pending: Arc<Mutex<Option<MeshStreamFrame>>>,
+    }
+
+    impl StreamRecvHalf for PausingRecv {
+        fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+            let phase = Arc::clone(&self.phase);
+            let pending = Arc::clone(&self.pending);
+            Box::pin(async move {
+                {
+                    let mut phase = phase.lock().expect("phase");
+                    match *phase {
+                        0 => *phase = 1,
+                        _ => return Ok(None),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                *phase.lock().expect("phase") = 2;
+                Ok(pending.lock().expect("pending").take())
+            })
+        }
+    }
+
+    struct RecordingSend {
+        frames: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl StreamSendHalf for RecordingSend {
+        fn send_frame(&mut self, frame: MeshStreamFrame) -> BoxFuture<'_, Result<(), MeshError>> {
+            let frames = Arc::clone(&self.frames);
+            Box::pin(async move {
+                if let MeshStreamFrame::Data { payload, .. } = frame {
+                    frames.lock().expect("frames").push(payload);
+                }
+                Ok(())
+            })
+        }
+
+        fn finish(&mut self) -> Result<(), MeshError> {
+            Ok(())
+        }
     }
 }
