@@ -420,25 +420,42 @@ pub(crate) async fn run_demo_echo(
     let mut stream = inbound.stream;
     tracing::info!(%session_id, %peer, "mesh demo echo: session open");
     let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    // `interval` is ready on its first tick, and `select!` drops every branch
+    // it does not take. `recv_validated` pulls the QUIC frame off the stream
+    // before its Redis fence await, so dropping that future discards the
+    // frame and the forwarder waits out its echo timeout. Pin the receive
+    // future and race `&mut` it so a drain tick cannot cancel the read.
     loop {
-        let frame = tokio::select! {
-            _ = drain_tick.tick() => {
-                if shutting_down.load(Ordering::Relaxed) {
-                    if let Some(community_id) = stream.community_id() {
-                        if let Err(e) = stream.send_goodbye(community_id, GoodbyeReason::Draining).await {
-                            tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
-                        } else {
-                            tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+        // The pinned future borrows `stream` for the whole read. End that
+        // scope before any drain close, which needs `stream` again.
+        let frame = {
+            let mut recv = std::pin::pin!(stream.recv_validated(&directory));
+            loop {
+                tokio::select! {
+                    _ = drain_tick.tick() => {
+                        if shutting_down.load(Ordering::Relaxed) {
+                            break None;
                         }
-                    } else {
-                        let _ = stream.finish();
-                        tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
                     }
-                    return;
+                    frame = &mut recv => break Some(frame),
                 }
-                continue;
             }
-            frame = stream.recv_validated(&directory) => frame,
+        };
+        let Some(frame) = frame else {
+            if let Some(community_id) = stream.community_id() {
+                if let Err(e) = stream
+                    .send_goodbye(community_id, GoodbyeReason::Draining)
+                    .await
+                {
+                    tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
+                } else {
+                    tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+                }
+            } else {
+                let _ = stream.finish();
+                tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
+            }
+            return;
         };
         match frame {
             Ok(Some(ReliableFrame::Data(payload))) => {
@@ -862,5 +879,177 @@ mod tests {
             fence.check(session, 1),
             crate::audio::mesh::FenceVerdict::Accept { .. }
         ));
+    }
+
+    /// A drain tick that fires while `recv_validated` is in flight must not
+    /// drop that future. The receive half below takes the only frame, then
+    /// waits longer than the 100ms drain period before yielding it. The old
+    /// `select!` dropped the future on that tick, the next read observed a
+    /// lost frame, and nothing was echoed.
+    #[tokio::test]
+    async fn demo_echo_drain_tick_does_not_drop_in_flight_frame() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let pool = deadpool_redis::Config::from_url(url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let mut conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        if redis::cmd("PING")
+            .query_async::<String>(&mut *conn)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        drop(conn);
+
+        let directory = SessionDirectory::with_lease_ttl(pool, std::time::Duration::from_secs(5));
+        let owner = rid(9);
+        let community_id = buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let session_id = uuid::Uuid::new_v4();
+        let lease = match directory
+            .acquire(community_id, session_id, owner, Profile::ReliableStream)
+            .await
+            .expect("acquire lease")
+        {
+            crate::tunnel::directory::AcquireResult::Acquired(lease) => lease,
+            crate::tunnel::directory::AcquireResult::Exists(_) => {
+                panic!("fresh session must acquire")
+            }
+        };
+        let fenced = lease.fenced_header();
+        let mut wire = Vec::with_capacity(18 + 18);
+        wire.push(1);
+        wire.push(1);
+        wire.extend_from_slice(community_id.as_uuid().as_bytes());
+        wire.extend_from_slice(b"mesh echo evidence");
+
+        let phase = Arc::new(Mutex::new(0u8));
+        let pending = Arc::new(Mutex::new(Some(MeshStreamFrame::Data {
+            fenced,
+            payload: wire,
+        })));
+        let echoed = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let inbound = ReliableInbound {
+            fenced,
+            from: rid(4),
+            stream: crate::tunnel::reliable::ReliableMeshStream::new_inbound(
+                fenced,
+                MeshStream::new(
+                    Box::new(RecordingSend {
+                        frames: Arc::clone(&echoed),
+                    }),
+                    Box::new(PausingRecv { phase, pending }),
+                ),
+            ),
+        };
+
+        let task = tokio::spawn(run_demo_echo(
+            directory,
+            inbound,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let echoed_payload = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(payload) = echoed.lock().expect("echoed").first().cloned() {
+                    return payload;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        task.abort();
+        let payload = echoed_payload.expect("drain tick dropped the in-flight echo frame");
+        assert!(
+            payload.ends_with(b"mesh echo evidence"),
+            "echoed payload {payload:?}"
+        );
+    }
+
+    /// Shutdown observed on the drain tick closes the stream without waiting
+    /// for a frame. The receive future stays pinned across that tick, so this
+    /// guards the close path against staying borrowed.
+    #[tokio::test]
+    async fn demo_echo_drain_tick_closes_when_shutting_down() {
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let directory = SessionDirectory::with_lease_ttl(pool, std::time::Duration::from_secs(5));
+        let fenced = FencedHeader {
+            session_id: uuid::Uuid::nil(),
+            generation: 1,
+            owner_runtime_id: rid(9),
+        };
+        let inbound = ReliableInbound {
+            fenced,
+            from: rid(4),
+            stream: crate::tunnel::reliable::ReliableMeshStream::new_inbound(
+                fenced,
+                MeshStream::new(Box::new(StubSend), Box::new(PendingRecv)),
+            ),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_demo_echo(directory, inbound, Arc::new(AtomicBool::new(true))),
+        )
+        .await
+        .expect("drain tick did not close the echo loop");
+    }
+
+    struct PendingRecv;
+
+    impl StreamRecvHalf for PendingRecv {
+        fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Delivers one frame only if the in-flight read is polled to completion.
+    /// A drop while `phase == 1` loses the frame, matching a QUIC read that
+    /// `select!` cancelled after bytes were already consumed.
+    struct PausingRecv {
+        phase: Arc<Mutex<u8>>,
+        pending: Arc<Mutex<Option<MeshStreamFrame>>>,
+    }
+
+    impl StreamRecvHalf for PausingRecv {
+        fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+            let phase = Arc::clone(&self.phase);
+            let pending = Arc::clone(&self.pending);
+            Box::pin(async move {
+                {
+                    let mut phase = phase.lock().expect("phase");
+                    match *phase {
+                        0 => *phase = 1,
+                        _ => return Ok(None),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                *phase.lock().expect("phase") = 2;
+                Ok(pending.lock().expect("pending").take())
+            })
+        }
+    }
+
+    struct RecordingSend {
+        frames: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl StreamSendHalf for RecordingSend {
+        fn send_frame(&mut self, frame: MeshStreamFrame) -> BoxFuture<'_, Result<(), MeshError>> {
+            let frames = Arc::clone(&self.frames);
+            Box::pin(async move {
+                if let MeshStreamFrame::Data { payload, .. } = frame {
+                    frames.lock().expect("frames").push(payload);
+                }
+                Ok(())
+            })
+        }
+
+        fn finish(&mut self) -> Result<(), MeshError> {
+            Ok(())
+        }
     }
 }
