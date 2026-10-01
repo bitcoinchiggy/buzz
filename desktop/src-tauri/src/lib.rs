@@ -10,6 +10,8 @@ mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+#[cfg_attr(not(test), allow(dead_code))]
+mod hpke_key_backup;
 mod huddle;
 mod identity_storage;
 mod initial_window;
@@ -896,6 +898,7 @@ pub fn run() {
             admin_list_restrictions,
             admin_lift_ban,
             admin_lift_timeout,
+            admin_direct_action,
             get_admin_origin,
             set_admin_origin,
             admin_discover_origin,

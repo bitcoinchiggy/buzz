@@ -8,8 +8,9 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+mod launch;
+
 use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
@@ -17,6 +18,9 @@ use crate::observer::{ObserverContext, ObserverHandle};
 use crate::usage::{
     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
 };
+
+#[path = "acp_frame_writer.rs"]
+mod frame_writer;
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
@@ -144,8 +148,8 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
-    /// Write end of the agent's stdin pipe.
-    stdin: ChildStdin,
+    /// Sole stdin writer; None after an interrupted/failed frame closes it.
+    stdin: Option<ChildStdin>,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
     /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
     /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
@@ -474,8 +478,7 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args);
+        let mut cmd = launch::command(command, args)?;
         if crate::config::normalize_agent_command_identity(command) == BUZZ_PI_ACP_NAME {
             if !args.iter().any(|arg| arg == "--") {
                 cmd.arg("--");
@@ -585,7 +588,13 @@ impl AcpClient {
                 _ => None,
             };
         cmd.envs(launch_env.iter().cloned());
-        let mut child = cmd.spawn()?;
+        cmd.env_remove(launch::PREFIX_ENV);
+        let mut child = cmd.spawn().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to spawn {:?}: {error}", cmd.as_std().get_program()),
+            )
+        })?;
 
         let stdin = child
             .stdin
@@ -598,7 +607,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
             pending_permission_id: None,
@@ -1124,12 +1133,10 @@ impl AcpClient {
     async fn write_ndjson(&mut self, value: &serde_json::Value) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(WRITE_TIMEOUT, async {
-            self.stdin.write_all(line.as_bytes()).await?;
-            self.stdin.write_all(b"\n").await?;
-            self.stdin.flush().await?;
-            Ok::<(), std::io::Error>(())
-        })
+        tokio::time::timeout(
+            WRITE_TIMEOUT,
+            frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
+        )
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;

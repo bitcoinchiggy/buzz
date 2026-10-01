@@ -444,18 +444,11 @@ test-unit:
         # and a red one could ship green (exactly how a broken admin test slipped
         # past every gate once). Scoped to api::admin, not the whole buzz-relay
         # --lib, because api::media has non-ignored tests that require Postgres.
-        # Two api::admin tests are excluded: both exercise a read-route DB
-        # fallthrough and pass without a database only by waiting out the sqlx
-        # acquire timeout (~30s each), so they do not belong in the infra-free
-        # unit job. nip98_mode_unrostered_signer_does_not_consume_a_replay_slot
-        # asserts a unique replay-guard invariant, so it is wired into the
-        # Postgres-backed Backend Integration job (see ci.yml "Admin API
-        # unrostered-signer replay invariant"). disabled_mode_allows_
-        # unauthenticated_requests_on_the_admin_host has no unique invariant:
-        # disabled-mode unauthenticated success is covered by
-        # disabled_mode_regression_pin_unauthenticated_request_is_served on the
-        # DB-free /probe route, and its Host/Origin gating is covered here by
-        # disabled_mode_still_requires_the_correct_host / _a_matching_origin.
+        # DB-backed api::admin tests are #[ignore]d and run in the PostgreSQL
+        # lane; the non-ignored ones reject before touching the database. Any
+        # new non-ignored test here must stay DB-free: without a database, a
+        # DB fallthrough only "passes" by waiting out the ~30s sqlx acquire
+        # timeout.
         # The second clause adds the relay's pure authorization-decision tests:
         # the NIP-29 channel membership grid (handlers::channel_authz), the
         # moderation capability grid (handlers::moderation_authz), and the pure
@@ -468,9 +461,63 @@ test-unit:
         # `handlers::`: the wider set is mostly Postgres-backed, and five of its
         # non-postgres_tests cases only "pass" without a database by waiting out
         # the ~30s sqlx acquire timeout, so they do not belong in the infra-free
-        # unit job either.
-        cargo nextest run -p buzz-relay --lib \
-            -E '(test(/^api::admin::/) - test(=api::admin::tests::disabled_mode_allows_unauthenticated_requests_on_the_admin_host) - test(=api::admin::tests::nip98_mode_unrostered_signer_does_not_consume_a_replay_slot)) + test(/^handlers::channel_authz::/) + test(/^handlers::moderation_authz::/) + test(/^handlers::side_effects::tests::/) + test(/^storage_sweep::tests::/)'
+        # unit job either. The REQ subscription-lifecycle tests are picked by
+        # exact name for the same reason: the rest of handlers::req needs a DB.
+        # The third clause adds the NIP-FI HTTP ingress and its router/config
+        # neighbours: nip_fi_http, nip_fi_config, router, api::parse_query_tests,
+        # and the Git transport off_mode_precedence_tests. All are infra-free
+        # and finish in well under a second with no DATABASE_URL, so none wait
+        # out the sqlx acquire timeout. `--bin buzz-relay` adds main.rs's
+        # `tests::` module (JWKS refresh cadence) and `composition_tests::`
+        # (JWKS source + refresh-loop composition), which `--lib` cannot reach
+        # because they live in the binary target; the nested
+        # `tests::postgres_tests::` stays in the PostgreSQL lane.
+        cargo nextest run -p buzz-relay --lib --bin buzz-relay \
+            -E 'test(/^api::admin::/) + test(/^handlers::channel_authz::/) + test(/^handlers::moderation_authz::/) + test(/^handlers::side_effects::tests::/) + test(/^storage_sweep::tests::/) + test(/^nip_fi_http::tests::/) + test(/^nip_fi_config::tests::/) + test(/^readiness::tests::/) + test(/^router::tests::/) + test(/^api::parse_query_tests::/) + test(/^api::git::transport::off_mode_precedence_tests::/) + test(/^audio::join::tests::/) + test(/^audio::handler::tests::/) + test(/^nip_fi_gate::tests::/) + test(/^nip_fi_session::tests::/) + test(=state::tests::neither_a_confirmed_inactive_community_nor_a_failed_lookup_admits_the_socket) + test(=handlers::req::tests::timed_out_historical_read_deregisters_before_closed) + test(=handlers::req::tests::superseded_timeout_leaves_replacement_intact) + test(=handlers::req::tests::search_claim_retires_live_and_yields_to_replacement) + test(=handlers::req::tests::concurrent_claims_and_stale_teardowns_keep_the_last_owner) + test(=handlers::req::tests::timeout_closed_is_emitted_before_a_replacement_can_claim) + test(=handlers::req::tests::revoke_then_replacement_keeps_replacement_whole) + test(=handlers::req::tests::claims_after_connection_cleanup_are_refused) + test(=handlers::req::tests::dropped_terminal_frame_cancels_connection) + test(=handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection) + (kind(bin) & (test(/^tests::/) + test(/^composition_tests::/) + test(/^env_filter_tests::/)) - test(/^tests::postgres_tests::/))'
+        # Note on audio::join::tests scope: the full suite is infra-free (no DB,
+        # no Redis). The infra-free audio/FI regression witnesses — bootstrap
+        # ordering barrier, CommitConfirmed arm, pending-close invisibility,
+        # abnormal-stream-close fanout, and never-ready-sink writer witnesses —
+        # are all selected by audio::join::tests and audio::handler::tests.
+        # DB-backed audio join tests use #[ignore] and run in the postgres lane.
+        # NIP-FI (S3) relay witnesses: the wholly-new nip_fi_upgrade module,
+        # the auth metrics contract module, plus the exact NIP-FI tests added,
+        # or whose assertions changed, in mixed modules (audio::room,
+        # connection, handlers::*, state). nip_fi_config and router are
+        # selected whole by the command above. Mixed modules are listed by exact
+        # name so main's unselected tests (several wait out the ~30s sqlx
+        # acquire timeout) stay out. NIP-FI tests that need Postgres live in
+        # postgres_tests and
+        # run in the PostgreSQL lane. Keep scripts/run-tests.sh in step.
+        cargo nextest run -p buzz-relay --lib -E '
+                test(/^nip_fi_upgrade::/)
+                + test(/^metrics::contract_tests::/)
+                + test(=audio::room::tests::roster_revisions_are_ordered_and_snapshot_is_authoritative)
+                + test(=connection::tests::auth_lifecycle_reconciles_every_terminal_and_never_leaks_gauge)
+                + test(=audio::room::tests::b1_pending_peer_removed_before_commit_emits_no_delta)
+                + test(=audio::room::tests::b2_commit_peer_emits_exactly_one_joined_delta_and_marks_visible)
+                + test(=audio::room::tests::b3_commit_peer_revision_is_monotone_between_concurrent_events)
+                + test(=audio::room::tests::f7a_pending_peer_excluded_from_snapshot_until_committed)
+                + test(=connection::tests::b2_cancelled_connection_event_frame_not_dispatched)
+                + test(=connection::tests::b3_expiry_denial_precedes_close_through_send_loop)
+                + test(=connection::tests::b3_root_pairing_denial_precedes_close_through_send_loop)
+                + test(=connection::tests::cancellation_during_select_with_fi_denial_routes_through_bounded_path)
+                + test(=connection::tests::cancelled_never_ready_sink_with_queued_fi_denial_exits_within_timeout)
+                + test(=connection::tests::deadline_exp_is_earliest_selects_exp)
+                + test(=connection::tests::deadline_max_connection_lifetime_is_earliest_selects_partition)
+                + test(=connection::tests::deadline_no_lifetime_returns_upstream_only)
+                + test(=connection::tests::expiry_notice_queued_on_ctrl_before_cancel)
+                + test(=connection::tests::f3_root_outer_wrapper_delivers_denial_on_bootstrap_cancellation)
+                + test(=connection::tests::f3_root_pre_built_expired_gate_terminates_connection)
+                + test(=handlers::auth::tests::b2_pre_cancelled_connection_never_becomes_authenticated)
+                + test(=handlers::auth::tests::fi_ban_check_error_emits_terminal_authorization_unavailable)
+                + test(=handlers::auth::tests::fi_invalid_nip42_proof_emits_terminal_evidence_rejected)
+                + test(=handlers::auth::tests::handle_auth_pairing_mismatch_runs_full_root_denial_path)
+                + test(=handlers::auth::tests::nip42_denial_class_separates_internal_failure_from_bad_evidence)
+                + test(=handlers::event::tests::p1b_agent_observer_event_barrier_expiry_blocks_fanout_and_ack)
+                + test(=handlers::req::tests::p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission)
+                + test(=state::tests::f3_cancellation_during_check_terminates_socket_without_waiting_for_check)
+                + test(=state::tests::on_not_run_runs_once_on_each_deny_arm_and_never_on_admit)'
         # ACP author-gate and queue tests protect the trust boundary between
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.
@@ -562,6 +609,10 @@ relay: bootstrap _ensure-migrations
     source .env
     set +o allexport
     cargo run -p buzz-relay
+
+# Post one root + N replies (and a few reactions) to the local dev relay, for eyeballing long threads
+seed-long-thread replies="187":
+    ./scripts/seed-long-thread.sh {{replies}}
 
 # Start the relay with the built web UI served from it
 relay-web: bootstrap _ensure-migrations
