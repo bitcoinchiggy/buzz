@@ -147,6 +147,13 @@ just ci                   # run before any PR
 
 See CONTRIBUTING.md for full setup details and dependency requirements.
 
+### Cursor Cloud specific instructions
+
+- Source `. ./bin/activate-hermit` before `cargo`, `pnpm`, `node`, `flutter`, or `just`. The image Node and Rust are older than the pins in `bin/`.
+- Postgres, Redis, Adminer, Keycloak, and Prometheus come from `docker compose`. In this nested VM the daemon uses `fuse-overlayfs` with iptables disabled; start it with `sudo dockerd` when `docker info` fails. Published ports are on `127.0.0.1`.
+- The MinIO tags pinned in `docker-compose.yml` are no longer anonymously pullable from quay.io. When that pull fails, run `cgr.dev/chainguard/minio` with the dev credentials in `.env.example` (`buzz_dev` / `buzz_dev_secret`, bucket `buzz-media`) on ports 9000 and 9001.
+- `curl http://127.0.0.1:3000/health` returns `ok` once `just relay` is up. Relay round-trip coverage is the ignored test `test_send_event_and_receive_via_subscription` in `crates/buzz-test-client/tests/e2e_relay.rs`.
+
 ---
 
 ## Quality Gates
