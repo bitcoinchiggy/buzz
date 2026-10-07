@@ -11,6 +11,7 @@ pub mod media;
 pub mod mesh_demo;
 pub mod nip05;
 pub mod operator;
+pub mod recorded_owner;
 pub mod workflows;
 
 // Re-export imeta helpers used by ingest pipeline.
@@ -250,6 +251,20 @@ pub mod relay_members {
         }
     }
 
+    /// Owner to persist after authentication has already succeeded.
+    ///
+    /// `membership_owner` is set when relay membership itself was granted
+    /// through a verified NIP-OA tag. A direct member, and an open relay,
+    /// still present that tag on the same request. First-write-wins
+    /// persistence ignores a second owner; a request with no verified tag
+    /// contributes nothing, so a null column stays null.
+    pub fn attested_owner(
+        membership_owner: Option<nostr::PublicKey>,
+        presented_owner: Option<nostr::PublicKey>,
+    ) -> Option<nostr::PublicKey> {
+        membership_owner.or(presented_owner)
+    }
+
     /// Persist a cryptographically verified NIP-OA agent→owner relationship.
     ///
     /// Both principals are ensured first because `agent_owner_pubkey` has a
@@ -336,6 +351,23 @@ pub mod relay_members {
 
             headers.append("x-auth-tag", HeaderValue::from_static("credential-two"));
             assert_eq!(extract_auth_tag_header(&headers), None);
+        }
+
+        #[test]
+        fn member_attestation_is_kept_when_membership_did_not_carry_an_owner() {
+            let owner = Keys::generate().public_key();
+            assert_eq!(
+                attested_owner(None, Some(owner)),
+                Some(owner),
+                "a direct member's verified tag is the owner to materialize"
+            );
+            assert_eq!(attested_owner(None, None), None);
+            let delegated = Keys::generate().public_key();
+            assert_eq!(
+                attested_owner(Some(delegated), Some(owner)),
+                Some(delegated),
+                "membership delegation already selected the owner"
+            );
         }
 
         /// Valid NIP-OA auth tag → returns Some(owner_pubkey).

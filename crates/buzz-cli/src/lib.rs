@@ -108,7 +108,7 @@ Configuration (flags override env vars):
   BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [required]
   BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
 
-The 'pack' subcommand runs locally and does not require a relay connection.
+The 'pack' subcommand and 'auth-tag compute' run locally and do not require a relay connection.
 
 Exit codes: 0=ok  1=bad input  2=relay/network error  3=auth error  4=other  5=write conflict
 Errors are JSON on stderr: {\"error\": \"<category>\", \"message\": \"<detail>\"}"
@@ -276,6 +276,9 @@ enum Cmd {
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
+    /// Compute a NIP-OA attestation locally. Does not connect to a relay.
+    #[command(subcommand, name = "auth-tag")]
+    AuthTag(AuthTagCmd),
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
@@ -978,6 +981,27 @@ pub enum UsersCmd {
         /// Remove your status entirely
         #[arg(long, conflicts_with_all = ["text", "emoji"])]
         clear: bool,
+    },
+    /// Read the relay's recorded agent owner.
+    ///
+    /// This is the `users.agent_owner_pubkey` column. A kind 0 profile,
+    /// including one that carries an `auth` tag, is not this value.
+    #[command(name = "recorded-owner")]
+    RecordedOwner {
+        /// Subject pubkey (64-char hex). Defaults to the authenticated key.
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+}
+
+/// Local NIP-OA attestation commands. No relay connection.
+#[derive(Subcommand)]
+pub enum AuthTagCmd {
+    /// Sign an empty-conditions attestation for one agent pubkey.
+    Compute {
+        /// Agent public key (64-char hex). Must differ from the signing key.
+        #[arg(long)]
+        agent: String,
     },
 }
 
@@ -2162,6 +2186,14 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     let keys = Keys::parse(&private_key_str)
         .map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?;
 
+    // Local attestation. The private key stays in this process. No relay
+    // client is constructed, and an unrelated BUZZ_AUTH_TAG is not required.
+    if let Cmd::AuthTag(ref sub) = cli.command {
+        return match sub {
+            AuthTagCmd::Compute { agent } => commands::auth_tag::cmd_compute(&keys, agent),
+        };
+    }
+
     // NIP-OA: parse and verify the auth tag if provided.
     //
     // `BUZZ_AUTH_TAG` is hand-authored configuration, so the unquoted raw
@@ -2214,7 +2246,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
-        Cmd::Pack(_) => unreachable!("handled above"),
+        Cmd::Pack(_) | Cmd::AuthTag(_) => unreachable!("handled above"),
     }
 }
 
