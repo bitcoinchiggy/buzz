@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod auth_tag;
 pub mod channel_templates;
 pub mod channels;
 pub mod dms;
@@ -16,6 +17,7 @@ pub mod pr;
 pub mod project_channel;
 pub mod projects;
 pub mod reactions;
+pub mod recorded_owner;
 mod repo_default_branch;
 pub mod repos;
 pub mod social;

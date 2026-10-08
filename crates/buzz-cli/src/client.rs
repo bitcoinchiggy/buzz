@@ -607,6 +607,11 @@ impl BuzzClient {
         Ok(event)
     }
 
+    /// Public key of the signing identity. Hex only; the secret is not returned.
+    pub fn signer_public_hex(&self) -> String {
+        self.keys.public_key().to_hex()
+    }
+
     /// Attach the `x-auth-tag` header if configured (NIP-OA relay membership delegation).
     fn with_auth_tag(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.auth_tag_json {

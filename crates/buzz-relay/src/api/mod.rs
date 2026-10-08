@@ -11,6 +11,7 @@ pub mod media;
 pub mod mesh_demo;
 pub mod nip05;
 pub mod operator;
+pub mod recorded_owner;
 pub mod workflows;
 
 // Re-export imeta helpers used by ingest pipeline.
@@ -250,6 +251,20 @@ pub mod relay_members {
         }
     }
 
+    /// Owner to persist after authentication has already succeeded.
+    ///
+    /// `membership_owner` is set when relay membership itself was granted
+    /// through a verified NIP-OA tag. A direct member, and an open relay,
+    /// still present that tag on the same request. First-write-wins
+    /// persistence ignores a second owner; a request with no verified tag
+    /// contributes nothing, so a null column stays null.
+    pub fn attested_owner(
+        membership_owner: Option<nostr::PublicKey>,
+        presented_owner: Option<nostr::PublicKey>,
+    ) -> Option<nostr::PublicKey> {
+        membership_owner.or(presented_owner)
+    }
+
     /// Persist a cryptographically verified NIP-OA agent→owner relationship.
     ///
     /// Both principals are ensured first because `agent_owner_pubkey` has a
@@ -338,6 +353,23 @@ pub mod relay_members {
             assert_eq!(extract_auth_tag_header(&headers), None);
         }
 
+        #[test]
+        fn member_attestation_is_kept_when_membership_did_not_carry_an_owner() {
+            let owner = Keys::generate().public_key();
+            assert_eq!(
+                attested_owner(None, Some(owner)),
+                Some(owner),
+                "a direct member's verified tag is the owner to materialize"
+            );
+            assert_eq!(attested_owner(None, None), None);
+            let delegated = Keys::generate().public_key();
+            assert_eq!(
+                attested_owner(Some(delegated), Some(owner)),
+                Some(delegated),
+                "membership delegation already selected the owner"
+            );
+        }
+
         /// Valid NIP-OA auth tag → returns Some(owner_pubkey).
         #[test]
         fn valid_nip_oa_returns_owner() {
@@ -421,6 +453,19 @@ pub mod relay_members {
             );
 
             assert_eq!(result, None);
+        }
+
+        #[test]
+        fn a_tag_for_a_different_agent_is_not_an_owner() {
+            let owner_keys = Keys::generate();
+            let agent = Keys::generate().public_key();
+            let other = Keys::generate().public_key();
+            let tag = compute_auth_tag(&owner_keys, &other, "").expect("sign other agent");
+            assert_eq!(
+                extract_nip_oa_owner(&agent.to_bytes(), Some(&tag), Some(1)),
+                None,
+                "a signature for another pubkey must not materialize this member"
+            );
         }
     }
 }

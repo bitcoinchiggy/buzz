@@ -361,6 +361,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/invites/claim", post(api::invites::claim_invite))
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
+        .route(
+            "/v1/users/{pubkey}/recorded-owner",
+            get(api::recorded_owner::get_recorded_owner),
+        )
         .route("/moderation/reports", get(api::bridge::moderation_reports))
         .route("/moderation/audit", get(api::bridge::moderation_audit))
         .route(
@@ -2673,6 +2677,10 @@ mod tests {
     // Protected paths — guard must deny these in Enforce mode.
     #[test]
     fn protected_paths_are_not_exempt() {
+        assert!(
+            !is_exempt("/v1/users/ab/recorded-owner"),
+            "GET recorded owner must be protected"
+        );
         assert!(!is_exempt("/events"), "POST /events must be protected");
         assert!(!is_exempt("/query"), "POST /query must be protected");
         assert!(!is_exempt("/count"), "POST /count must be protected");

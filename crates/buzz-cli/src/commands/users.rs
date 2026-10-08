@@ -558,6 +558,9 @@ pub async fn dispatch(
         }
         UsersCmd::Presence { pubkeys } => cmd_get_presence(client, &pubkeys).await,
         UsersCmd::SetPresence { status } => cmd_set_presence(client, &status.to_string()).await,
+        UsersCmd::RecordedOwner { pubkey } => {
+            crate::commands::recorded_owner::cmd_recorded_owner(client, pubkey.as_deref()).await
+        }
         UsersCmd::SetStatus { text, emoji, clear } => {
             // `--clear` is mutually exclusive with `--text`/`--emoji`: publish the
             // empty `d:general` event that clients read as "no status".

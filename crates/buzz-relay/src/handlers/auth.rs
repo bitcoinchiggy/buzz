@@ -391,21 +391,18 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             };
 
-            // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
-            // (needed for observer frame auth). Only runs on open relays — on closed
-            // relays, enforce_relay_membership already handles NIP-OA delegation.
-            // No feature flag needed: NIP-OA is cryptographically self-proving.
-            let nip_oa_owner = nip_oa_owner.or_else(|| {
-                if !state.config.require_relay_membership && auth_tag_json.is_some() {
-                    crate::api::relay_members::extract_nip_oa_owner(
-                        pubkey.as_bytes(),
-                        auth_tag_json.as_deref(),
-                        Some(signed_auth_created_at),
-                    )
-                } else {
-                    None
-                }
-            });
+            // A direct member used to skip this. Membership and ownership are
+            // different facts: the tag still has to be materialized on the
+            // first authenticated request that presents it, including when
+            // the agent was admitted before that request. An absent tag
+            // leaves a null column unchanged.
+            let presented_owner = crate::api::relay_members::extract_nip_oa_owner(
+                pubkey.as_bytes(),
+                auth_tag_json.as_deref(),
+                Some(signed_auth_created_at),
+            );
+            let nip_oa_owner =
+                crate::api::relay_members::attested_owner(nip_oa_owner, presented_owner);
 
             // B2: acquire a session effect permit after the last policy read
             // and before the first persistent write — NIP-OA materialization

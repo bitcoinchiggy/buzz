@@ -108,7 +108,7 @@ Configuration (flags override env vars):
   BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [required]
   BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
 
-The 'pack' subcommand runs locally and does not require a relay connection.
+The 'pack' subcommand and 'auth-tag compute' run locally and do not require a relay connection.
 
 Exit codes: 0=ok  1=bad input  2=relay/network error  3=auth error  4=other  5=write conflict
 Errors are JSON on stderr: {\"error\": \"<category>\", \"message\": \"<detail>\"}"
@@ -276,6 +276,9 @@ enum Cmd {
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
+    /// Compute a NIP-OA attestation locally. Does not connect to a relay.
+    #[command(subcommand, name = "auth-tag")]
+    AuthTag(AuthTagCmd),
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
@@ -978,6 +981,36 @@ pub enum UsersCmd {
         /// Remove your status entirely
         #[arg(long, conflicts_with_all = ["text", "emoji"])]
         clear: bool,
+    },
+    /// Read the relay's recorded agent owner.
+    ///
+    /// This is the `users.agent_owner_pubkey` column. A kind 0 profile,
+    /// including one that carries an `auth` tag, is not this value.
+    #[command(name = "recorded-owner")]
+    RecordedOwner {
+        /// Subject pubkey (64-char hex). Defaults to the authenticated key.
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+}
+
+/// Local NIP-OA attestation commands. No relay connection.
+#[derive(Subcommand)]
+pub enum AuthTagCmd {
+    /// Sign an empty-conditions attestation for one agent pubkey.
+    Compute {
+        /// Agent public key (64-char hex). Must differ from the signing key.
+        #[arg(long)]
+        agent: String,
+    },
+    /// Verify an attestation locally. Reads the tag from stdin.
+    Verify {
+        /// Agent public key (64-char hex). The signature must bind this key.
+        #[arg(long)]
+        agent: String,
+        /// Expected owner public key (64-char hex).
+        #[arg(long)]
+        provisioner: String,
     },
 }
 
@@ -2154,6 +2187,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Local verification. No private key and no relay client. A tag that
+    // does not verify for this agent and provisioner is not an owner.
+    if let Cmd::AuthTag(AuthTagCmd::Verify { agent, provisioner }) = &cli.command {
+        let mut tag = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut tag)
+            .map_err(|_| CliError::Other("auth tag is not valid".into()))?;
+        return commands::auth_tag::cmd_verify(agent, provisioner, &tag);
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2161,6 +2203,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     })?;
     let keys = Keys::parse(&private_key_str)
         .map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?;
+
+    // Local attestation. The private key stays in this process. No relay
+    // client is constructed, and an unrelated BUZZ_AUTH_TAG is not required.
+    if let Cmd::AuthTag(ref sub) = cli.command {
+        return match sub {
+            AuthTagCmd::Compute { agent } => commands::auth_tag::cmd_compute(&keys, agent),
+            AuthTagCmd::Verify { .. } => unreachable!("handled above"),
+        };
+    }
 
     // NIP-OA: parse and verify the auth tag if provided.
     //
@@ -2214,7 +2265,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
-        Cmd::Pack(_) => unreachable!("handled above"),
+        Cmd::Pack(_) | Cmd::AuthTag(_) => unreachable!("handled above"),
     }
 }
 
@@ -2366,6 +2417,7 @@ mod tests {
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
             "agents",
+            "auth-tag",
             "canvas",
             "channels",
             "dms",
@@ -2439,6 +2491,7 @@ mod tests {
                 "unarchive"
             ]
         );
+        assert_eq!(names(&cmd, "auth-tag"), vec!["compute", "verify"]);
         assert_eq!(
             names(&cmd, "messages"),
             vec![
@@ -2491,6 +2544,7 @@ mod tests {
             vec![
                 "get",
                 "presence",
+                "recorded-owner",
                 "set-presence",
                 "set-profile",
                 "set-status"
@@ -2580,6 +2634,7 @@ mod tests {
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
             ("agents", 5),
+            ("auth-tag", 2),
             ("canvas", 4),
             ("channels", 16),
             ("dms", 4),
@@ -2596,7 +2651,7 @@ mod tests {
             ("repos", 6),
             ("social", 7),
             ("upload", 1),
-            ("users", 5),
+            ("users", 6),
             ("workflows", 8),
         ];
 
