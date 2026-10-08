@@ -454,6 +454,19 @@ pub mod relay_members {
 
             assert_eq!(result, None);
         }
+
+        #[test]
+        fn a_tag_for_a_different_agent_is_not_an_owner() {
+            let owner_keys = Keys::generate();
+            let agent = Keys::generate().public_key();
+            let other = Keys::generate().public_key();
+            let tag = compute_auth_tag(&owner_keys, &other, "").expect("sign other agent");
+            assert_eq!(
+                extract_nip_oa_owner(&agent.to_bytes(), Some(&tag), Some(1)),
+                None,
+                "a signature for another pubkey must not materialize this member"
+            );
+        }
     }
 }
 

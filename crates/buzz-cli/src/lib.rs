@@ -1003,6 +1003,15 @@ pub enum AuthTagCmd {
         #[arg(long)]
         agent: String,
     },
+    /// Verify an attestation locally. Reads the tag from stdin.
+    Verify {
+        /// Agent public key (64-char hex). The signature must bind this key.
+        #[arg(long)]
+        agent: String,
+        /// Expected owner public key (64-char hex).
+        #[arg(long)]
+        provisioner: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2178,6 +2187,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Local verification. No private key and no relay client. A tag that
+    // does not verify for this agent and provisioner is not an owner.
+    if let Cmd::AuthTag(AuthTagCmd::Verify { agent, provisioner }) = &cli.command {
+        let mut tag = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut tag)
+            .map_err(|_| CliError::Other("auth tag is not valid".into()))?;
+        return commands::auth_tag::cmd_verify(agent, provisioner, &tag);
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2191,6 +2209,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     if let Cmd::AuthTag(ref sub) = cli.command {
         return match sub {
             AuthTagCmd::Compute { agent } => commands::auth_tag::cmd_compute(&keys, agent),
+            AuthTagCmd::Verify { .. } => unreachable!("handled above"),
         };
     }
 
