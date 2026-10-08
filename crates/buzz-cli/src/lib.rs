@@ -2417,6 +2417,7 @@ mod tests {
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
             "agents",
+            "auth-tag",
             "canvas",
             "channels",
             "dms",
@@ -2490,6 +2491,7 @@ mod tests {
                 "unarchive"
             ]
         );
+        assert_eq!(names(&cmd, "auth-tag"), vec!["compute", "verify"]);
         assert_eq!(
             names(&cmd, "messages"),
             vec![
@@ -2542,6 +2544,7 @@ mod tests {
             vec![
                 "get",
                 "presence",
+                "recorded-owner",
                 "set-presence",
                 "set-profile",
                 "set-status"
@@ -2631,6 +2634,7 @@ mod tests {
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
             ("agents", 5),
+            ("auth-tag", 2),
             ("canvas", 4),
             ("channels", 16),
             ("dms", 4),
@@ -2647,7 +2651,7 @@ mod tests {
             ("repos", 6),
             ("social", 7),
             ("upload", 1),
-            ("users", 5),
+            ("users", 6),
             ("workflows", 8),
         ];
 

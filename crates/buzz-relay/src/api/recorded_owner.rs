@@ -11,11 +11,14 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
-use serde_json::{json, Value};
+use serde_json::json;
+
+#[cfg(test)]
+use serde_json::Value;
 
 use buzz_auth::NipFiMode;
 
-use crate::nip_fi_http::{admit_nip_fi_http_on_state, Nip98Proof};
+use crate::nip_fi_http::admit_nip_fi_http_on_state;
 use crate::state::AppState;
 
 use super::relay_members::{attested_owner, extract_auth_tag_header, extract_nip_oa_owner};
@@ -113,17 +116,19 @@ pub async fn get_recorded_owner(
     let path = format!("/v1/users/{subject_hex}/recorded-owner");
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, &path);
     let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
-    let admission = match admit_nip_fi_http_on_state(&state, &headers, || {
-        super::bridge::verify_bridge_auth(
-            &headers,
+    let require_auth = state.config.require_auth_token || nip_fi_active;
+    let admission = match admit_nip_fi_http_on_state(
+        &state,
+        &headers,
+        super::bridge::make_nip98_closure_for_admission(
+            headers.clone(),
             "GET",
-            &url,
+            url,
             None,
-            state.config.require_auth_token || nip_fi_active,
-        )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
-        .map_err(|error| error.into_response())
-    }) {
+            require_auth,
+            false,
+        ),
+    ) {
         Ok(admission) => admission,
         Err(response) => return response,
     };
