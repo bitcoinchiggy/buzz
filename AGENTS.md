@@ -792,3 +792,15 @@ persistent automatic addresses. Use the returned label from registration for
 insert/restore/remove. Ambiguous manually typed names must fail visibly without
 clearing the draft in chat, edit, and standalone forum consumers; never fan out
 silently to all identities sharing a name. See `docs/mention-editor.md`.
+
+---
+
+## Cursor Cloud specific instructions
+
+Cloud Agents boot with system `rustc` 1.83 and Node 22 on `PATH`. This repo pins Rust 1.95, Node 24, pnpm 11, and Flutter 3.41 through Hermit. Source `bin/activate-hermit`, or prepend `bin/` to `PATH`, before `cargo`, `node`, `pnpm`, `flutter`, or `just`.
+
+The environment start script launches `dockerd` with the `fuse-overlayfs` storage driver, then runs `docker compose up` for Postgres, Redis, MinIO, Keycloak, Adminer, and Prometheus. Anonymous pulls of `quay.io/minio` fail, so start writes a gitignored `docker-compose.override.yml` that pins `pgsty/minio` for `minio` and `minio-init`. Keep that file. The relay runs in the `buzz-relay` tmux session. `GET http://127.0.0.1:3000/health` returns `ok`, and readiness is `GET http://127.0.0.1:8080/_readiness`.
+
+An 8GiB swapfile is at `/swapfile`. Debug builds of the workspace need that extra memory on the default VM.
+
+To exercise the relay, follow the smoke sequence in [TESTING.md](TESTING.md): `buzz-admin generate-key`, `buzz channels create`, `buzz messages send`, then `buzz messages get`.
